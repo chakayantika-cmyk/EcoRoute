@@ -146,7 +146,7 @@ export default function HistoryPage() {
                       {String(task.inputText)}
                     </p>
                     <div className="flex flex-wrap items-center gap-3 text-caption text-eco-text-secondary dark:text-dark-text-secondary">
-                      <span>{TASK_STATUS_LABELS[String(task.status)] ?? task.status}</span>
+                      <span>{TASK_STATUS_LABELS[String(task.status)] ?? String(task.status)}</span>
                       {routing && (
                         <>
                           <span>·</span>

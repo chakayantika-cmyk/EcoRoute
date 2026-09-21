@@ -39,10 +39,46 @@ export async function tasksRoutes(fastify: FastifyInstance) {
     }
   });
 
-  // POST /api/v1/tasks/stream — Create and route task with Server-Sent Events (SSE) streaming
-  fastify.post('/stream', async (request, reply) => {
+  // Reusable streaming handler for /stream and /route-stream
+  const handleStreamingTask = async (request: any, reply: any) => {
     const body = createTaskSchema.parse(request.body);
+    const idempotencyKey = (request.headers['idempotency-key'] || request.headers['x-idempotency-key']) as string | undefined;
+
+    // Check if task with this idempotency key already exists and is completed
+    if (idempotencyKey) {
+      const existing = await fastify.prisma.task.findUnique({
+        where: { idempotencyKey },
+        include: { routingResult: true, answer: true },
+      });
+      if (existing && existing.status === 'COMPLETED' && existing.userId === request.userId) {
+        reply.raw.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          'Connection': 'keep-alive',
+        });
+        reply.raw.write(`event: taskCreated\ndata: ${JSON.stringify({ taskId: existing.id, inputText: existing.inputText })}\n\n`);
+        if (existing.routingResult?.candidateScoresJson) {
+          try {
+            const parsed = JSON.parse(existing.routingResult.candidateScoresJson);
+            reply.raw.write(`event: evaluations\ndata: ${JSON.stringify(parsed.evaluations || [])}\n\n`);
+          } catch {}
+        }
+        if (existing.answer?.answerText) {
+          reply.raw.write(`event: chunk\ndata: ${JSON.stringify({ chunk: existing.answer.answerText, fullText: existing.answer.answerText })}\n\n`);
+        }
+        reply.raw.write(`event: completed\ndata: ${JSON.stringify({ taskId: existing.id, status: 'completed' })}\n\n`);
+        reply.raw.end();
+        return;
+      }
+    }
+
     const task = await tasksService.createTask(request.userId!, body.inputText);
+    if (idempotencyKey) {
+      await fastify.prisma.task.update({
+        where: { id: task.id },
+        data: { idempotencyKey },
+      }).catch(() => {});
+    }
 
     reply.raw.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
@@ -52,8 +88,12 @@ export async function tasksRoutes(fastify: FastifyInstance) {
     });
 
     const abortController = new AbortController();
-    request.raw.on('close', () => {
+    request.raw.on('close', async () => {
       abortController.abort();
+      await fastify.prisma.task.update({
+        where: { id: task.id },
+        data: { status: 'CANCELLED' },
+      }).catch(() => {});
     });
 
     const sendSse = (event: string, data: any) => {
@@ -84,7 +124,14 @@ export async function tasksRoutes(fastify: FastifyInstance) {
         reply.raw.end();
       }
     }
-  });
+  };
+
+  // POST /api/v1/tasks/stream — Create and route task with Server-Sent Events (SSE) streaming
+  fastify.post('/stream', handleStreamingTask);
+
+  // POST /api/v1/tasks/route-stream — Explicit stream endpoint matching specification section 6
+  fastify.post('/route-stream', handleStreamingTask);
+
 
   // GET /api/v1/tasks — List tasks
   fastify.get('/', async (request, reply) => {

@@ -4,7 +4,59 @@
 
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from './hooks/useAuth';
-import { ReactNode } from 'react';
+import { Component, ErrorInfo, ReactNode } from 'react';
+
+interface ErrorBoundaryProps {
+  children: ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error('Uncaught React Error:', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-eco-bg dark:bg-dark-bg p-8 flex items-center justify-center">
+          <div className="max-w-xl w-full p-6 bg-white dark:bg-dark-surface rounded-2xl shadow-xl border border-red-200 dark:border-red-900">
+            <h2 className="text-heading-3 text-red-600 dark:text-red-400 mb-2 font-serif">Something went wrong</h2>
+            <p className="text-body text-eco-text-secondary dark:text-dark-text-secondary mb-4">
+              An unexpected error occurred while rendering the page:
+            </p>
+            <pre className="p-3 bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 rounded-lg text-caption font-mono overflow-auto mb-4">
+              {this.state.error?.message || 'Unknown error'}
+            </pre>
+            <button
+              onClick={() => {
+                this.setState({ hasError: false, error: null });
+                window.location.reload();
+              }}
+              className="btn-primary"
+            >
+              Reload Page
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // Pages
 import LandingPage from './pages/LandingPage';
@@ -85,8 +137,10 @@ function AppRoutes() {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <AppRoutes />
-    </AuthProvider>
+    <ErrorBoundary>
+      <AuthProvider>
+        <AppRoutes />
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }

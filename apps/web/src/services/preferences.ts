@@ -15,10 +15,43 @@ export const preferencesService = {
     return api.post<{ data: Record<string, unknown> }>('/preferences/reset');
   },
   getApiKeys() {
-    return api.get<{ data: Record<string, boolean> }>('/preferences/api-keys');
+    return api.get<{
+      data: {
+        google_gemini: boolean;
+        groq: boolean;
+        ollama: boolean;
+        openai: boolean;
+        anthropic: boolean;
+        details?: Record<string, { configured: boolean; maskedKey?: string }>;
+        freeModelsOnly?: boolean;
+      };
+    }>('/preferences/api-keys');
   },
-  updateApiKeys(keys: { geminiApiKey?: string; openaiApiKey?: string; anthropicApiKey?: string }) {
-    return api.put<{ data: { message: string } }>('/preferences/api-keys', keys);
+  updateApiKeys(keys: {
+    geminiApiKey?: string;
+    groqApiKey?: string;
+    openaiApiKey?: string;
+    anthropicApiKey?: string;
+    freeModelsOnly?: boolean;
+  }) {
+    return api.put<{ data: { message: string; freeModelsOnly?: boolean } }>('/preferences/api-keys', keys);
+  },
+  testProvider(providerKey: string) {
+    return api.post<{
+      data: {
+        providerKey: string;
+        name: string;
+        configured: boolean;
+        reachable: boolean;
+        authenticated: boolean;
+        status: 'HEALTHY' | 'UNREACHABLE' | 'UNCONFIGURED' | 'DEGRADED';
+        errorMessage: string | null;
+        discoveredModelsCount: number;
+        catalogModelsCount: number;
+        freeModelsCount: number;
+        lastCheckedAt: string;
+      };
+    }>(`/providers/${providerKey}/test`);
   },
 };
 

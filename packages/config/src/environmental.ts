@@ -128,6 +128,58 @@ export const DEFAULT_PUE = 1.2;
  */
 export const GRID_CARBON_INTENSITY_KG_PER_KWH = 0.4;
 
+export function getCarbonIntensityKgPerKWh(): { value: number; source: string } {
+  const envVal = process.env.CARBON_INTENSITY_KG_PER_KWH;
+  if (envVal && !isNaN(Number(envVal))) {
+    return {
+      value: Number(envVal),
+      source: process.env.CARBON_INTENSITY_SOURCE || 'Custom Environment Configuration',
+    };
+  }
+  return {
+    value: GRID_CARBON_INTENSITY_KG_PER_KWH,
+    source: 'IEA (2023) Global Grid Average',
+  };
+}
+
+export function getWaterIntensityLitersPerKWh(): { value: number | null; source: string } {
+  const envVal = process.env.WATER_INTENSITY_L_PER_KWH;
+  if (envVal && !isNaN(Number(envVal)) && Number(envVal) > 0) {
+    return {
+      value: Number(envVal),
+      source: process.env.WATER_INTENSITY_SOURCE || 'Regional Utility Water Footprint',
+    };
+  }
+  return {
+    value: null,
+    source: 'Unavailable (no defensible regional water intensity configured)',
+  };
+}
+
+export interface MetricUncertainty {
+  value: number;
+  uncertaintyPercent: number;
+  lowerBound: number;
+  upperBound: number;
+  confidenceLevel: 'high' | 'medium' | 'low';
+}
+
+export function calculateUncertainty(
+  value: number,
+  confidenceLevel: 'high' | 'medium' | 'low' = 'medium',
+): MetricUncertainty {
+  const pctMap = { high: 0.05, medium: 0.15, low: 0.30 };
+  const pct = pctMap[confidenceLevel];
+  const delta = value * pct;
+  return {
+    value,
+    uncertaintyPercent: Math.round(pct * 100),
+    lowerBound: Math.round(Math.max(0, value - delta) * 10000) / 10000,
+    upperBound: Math.round((value + delta) * 10000) / 10000,
+    confidenceLevel,
+  };
+}
+
 /**
  * Calculate estimated environmental impact for a given number of tokens (Methodology v1 legacy).
  */
@@ -142,14 +194,18 @@ export function calculateEnvironmentalEstimate(
   const carbonKg = (totalEnergyWh / 1000) * carbonIntensity;
   const carbonGrams = carbonKg * 1000;
 
+  const waterCfg = getWaterIntensityLitersPerKWh();
+  const waterLiters = waterCfg.value != null ? (totalEnergyWh / 1000) * waterCfg.value : null;
+
   return {
     energyWh: Math.round(totalEnergyWh * 10000) / 10000,
     carbonGrams: Math.round(carbonGrams * 10000) / 10000,
+    waterLiters: waterLiters != null ? Math.round(waterLiters * 10000) / 10000 : null,
   };
 }
 
 /**
- * Dual-Phase Sequence-Length Energy & Carbon Model
+ * Dual-Phase Sequence-Length Energy, Carbon & Water Model
  * Directly implements the empirical formulation from:
  * "Trends in AI inference energy consumption: Beyond the performance-vs-parameter laws of deep learning" (2023)
  * E_total = (L_in * e_prefill + L_out * e_decode) * PUE
@@ -159,8 +215,11 @@ export function calculateDualPhaseEnvironmentalEstimate(
   outputTokens: number,
   profile: ModelEnergyProfile,
   pue: number = DEFAULT_PUE,
-  carbonIntensity: number = GRID_CARBON_INTENSITY_KG_PER_KWH,
+  carbonIntensityOverride?: number,
 ) {
+  const carbonCfg = getCarbonIntensityKgPerKWh();
+  const carbonIntensity = carbonIntensityOverride ?? carbonCfg.value;
+
   const prefillEnergyWh = inputTokens * profile.prefillEnergyPerTokenWh;
   const decodeEnergyWh = outputTokens * profile.decodeEnergyPerTokenWh;
   const inferenceEnergyWh = prefillEnergyWh + decodeEnergyWh;
@@ -168,10 +227,48 @@ export function calculateDualPhaseEnvironmentalEstimate(
   const carbonKg = (totalEnergyWh / 1000) * carbonIntensity;
   const carbonGrams = carbonKg * 1000;
 
+  const waterCfg = getWaterIntensityLitersPerKWh();
+  const waterLiters = waterCfg.value != null ? (totalEnergyWh / 1000) * waterCfg.value : null;
+
   return {
     prefillEnergyWh: Math.round(prefillEnergyWh * 100000) / 100000,
     decodeEnergyWh: Math.round(decodeEnergyWh * 100000) / 100000,
     energyWh: Math.round(totalEnergyWh * 10000) / 10000,
     carbonGrams: Math.round(carbonGrams * 10000) / 10000,
+    waterLiters: waterLiters != null ? Math.round(waterLiters * 10000) / 10000 : null,
+    carbonSource: carbonCfg.source,
+    waterSource: waterCfg.source,
+    confidence: profile.confidence,
   };
 }
+
+/**
+ * Calculate Router Overhead from measured CPU/compute duration and power model
+ */
+export function calculateRouterOverhead(
+  latencyMs: number,
+  powerWatts: number = 65,
+  carbonIntensityOverride?: number,
+) {
+  const carbonCfg = getCarbonIntensityKgPerKWh();
+  const carbonIntensity = carbonIntensityOverride ?? carbonCfg.value;
+  const computeSeconds = latencyMs / 1000;
+  const routerEnergyWh = (computeSeconds * powerWatts) / 3600;
+  const carbonKg = (routerEnergyWh / 1000) * carbonIntensity;
+  const routerCarbonGrams = carbonKg * 1000;
+
+  const waterCfg = getWaterIntensityLitersPerKWh();
+  const routerWaterLiters = waterCfg.value != null ? (routerEnergyWh / 1000) * waterCfg.value : null;
+
+  return {
+    routerLatencyMs: Math.max(1, Math.round(latencyMs)),
+    routerCostUsd: null as number | null, // Deterministic local CPU has no external API cost
+    routerEnergyWh: Math.round(routerEnergyWh * 100000) / 100000,
+    routerWaterLiters: routerWaterLiters != null ? Math.round(routerWaterLiters * 100000) / 100000 : null,
+    routerCarbonGrams: Math.round(routerCarbonGrams * 100000) / 100000,
+    carbonSource: carbonCfg.source,
+    waterSource: waterCfg.source,
+    measurementType: 'modeled' as const,
+  };
+}
+

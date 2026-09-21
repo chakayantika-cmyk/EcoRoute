@@ -115,13 +115,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setUser(response.data);
         } catch {
           clearAuth();
-          setIsMockMode(true);
+          setIsMockMode(false);
         }
       } finally {
         setIsLoading(false);
       }
     };
     initAuth();
+
+    // Check if backend is explicitly in mock mode
+    const apiUrl = (import.meta as any).env?.VITE_API_URL?.replace(/\/v1$/, '') || 'http://localhost:3001/api';
+    fetch(`${apiUrl}/health`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data?.mockMode === true) {
+          setIsMockMode(true);
+        }
+      })
+      .catch(() => {});
   }, [clearAuth, refreshAuth]);
 
   return (

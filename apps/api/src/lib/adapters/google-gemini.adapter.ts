@@ -13,6 +13,7 @@ import {
   NormalizedGenerationRequest,
   NormalizedGenerationResponse,
 } from './provider-adapter.interface';
+import { ProviderNotConfiguredError } from '../errors';
 
 const PROVIDER_TIMEOUT_MS = 30000;
 
@@ -104,7 +105,7 @@ export class GoogleGeminiAdapter implements AIProviderAdapter {
 
   async generate(request: NormalizedGenerationRequest): Promise<NormalizedGenerationResponse> {
     if (!this.apiKey) {
-      throw new Error(`PROVIDER_NOT_CONFIGURED: API key missing for provider ${this.providerKey}`);
+      throw new ProviderNotConfiguredError(this.providerKey);
     }
 
     const startTime = Date.now();
@@ -188,7 +189,7 @@ export class GoogleGeminiAdapter implements AIProviderAdapter {
     onChunk: (chunk: string) => void,
   ): Promise<NormalizedGenerationResponse> {
     if (!this.apiKey) {
-      throw new Error(`PROVIDER_NOT_CONFIGURED: API key missing for provider ${this.providerKey}`);
+      throw new ProviderNotConfiguredError(this.providerKey);
     }
 
     const startTime = Date.now();

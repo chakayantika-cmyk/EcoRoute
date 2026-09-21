@@ -4,6 +4,7 @@
 // ============================================================================
 
 import { PrismaClient } from '@prisma/client';
+import { KNOWN_MODEL_PRICING } from '@ecoroute/config';
 
 const prisma = new PrismaClient();
 
@@ -637,6 +638,40 @@ async function main() {
     },
     {
       providerKey: 'ollama',
+      modelKey: 'smollm:135m',
+      providerModelId: 'smollm:135m',
+      displayName: 'SmolLM 135M (Local)',
+      family: 'smollm',
+      version: 'Local',
+      description: 'Ultra-compact lightweight local language model running entirely on workstation hardware with sub-100ms latency.',
+      caps: makeCaps({ reasoning: true, coding: true, structuredOutput: true }),
+      contextWindow: 8192,
+      maxOutputTokens: 2048,
+      pricing: { inputPricePerMillionTokens: 0.00, outputPricePerMillionTokens: 0.00, currency: 'USD' },
+      performance: { estimatedLatencyMs: 120, tokensPerSecond: 180 },
+      env: { energyPerMillionTokensWh: 35, carbonGramsPerMillionTokens: 14, confidence: 'high', source: 'Local Ultra-Compact Hardware Modeling' },
+      tags: ['local', 'zero-cloud-cost', 'ultra-fast', 'green'],
+      isDefault: false,
+    },
+    {
+      providerKey: 'ollama',
+      modelKey: 'qwen2.5:0.5b',
+      providerModelId: 'qwen2.5:0.5b',
+      displayName: 'Qwen 2.5 0.5B (Local)',
+      family: 'qwen',
+      version: 'Local',
+      description: 'High-capability compact local model with strong multilingual and reasoning abilities on workstation hardware.',
+      caps: makeCaps({ reasoning: true, coding: true, mathematics: true, structuredOutput: true }),
+      contextWindow: 32768,
+      maxOutputTokens: 4096,
+      pricing: { inputPricePerMillionTokens: 0.00, outputPricePerMillionTokens: 0.00, currency: 'USD' },
+      performance: { estimatedLatencyMs: 180, tokensPerSecond: 130 },
+      env: { energyPerMillionTokensWh: 50, carbonGramsPerMillionTokens: 20, confidence: 'high', source: 'Local Compact Hardware Modeling' },
+      tags: ['local', 'zero-cloud-cost', 'compact', 'reasoning'],
+      isDefault: false,
+    },
+    {
+      providerKey: 'ollama',
       modelKey: 'llama3.1:8b',
       providerModelId: 'llama3.1:8b',
       displayName: 'Llama 3.1 8B (Local)',
@@ -840,6 +875,14 @@ async function main() {
     const providerId = providerMap.get(m.providerKey);
     if (!providerId) continue;
 
+    const pricingInfo = KNOWN_MODEL_PRICING[m.providerModelId] || KNOWN_MODEL_PRICING[m.modelKey] || {
+      pricingTier: m.providerKey === 'mock' ? 'free' : (m.pricing?.inputPricePerMillionTokens === 0 ? 'free' : 'paid'),
+      pricingSource: m.providerKey === 'mock' ? 'Mock Simulation' : 'Provider Standard Pricing',
+      pricingLastUpdated: '2026-03-01',
+    };
+    const executionMode = m.providerKey === 'ollama' ? 'local' : 'cloud';
+    const pricingLastVerified = new Date(pricingInfo.pricingLastUpdated);
+
     await prisma.aIModel.upsert({
       where: {
         providerId_modelKey: {
@@ -862,6 +905,17 @@ async function main() {
         contextWindowTokens: m.contextWindow,
         maxOutputTokens: m.maxOutputTokens,
         pricingJson: JSON.stringify(m.pricing),
+        pricingTier: pricingInfo.pricingTier,
+        pricingSource: pricingInfo.pricingSource,
+        pricingLastVerified,
+        executionMode,
+        availabilityStatus: 'READY',
+        availabilityLastChecked: new Date(),
+        accountAccessStatus: 'eligible',
+        quotaStatus: 'available',
+        metadataSource: 'EcoRoute Model Registry',
+        metadataLastVerified: new Date('2026-03-01'),
+        methodologyVersion: 'v2',
         performanceJson: JSON.stringify(m.performance),
         environmentalMetricsJson: JSON.stringify(m.env),
         tagsJson: JSON.stringify(m.tags),
@@ -884,6 +938,17 @@ async function main() {
         contextWindowTokens: m.contextWindow,
         maxOutputTokens: m.maxOutputTokens,
         pricingJson: JSON.stringify(m.pricing),
+        pricingTier: pricingInfo.pricingTier,
+        pricingSource: pricingInfo.pricingSource,
+        pricingLastVerified,
+        executionMode,
+        availabilityStatus: 'READY',
+        availabilityLastChecked: new Date(),
+        accountAccessStatus: 'eligible',
+        quotaStatus: 'available',
+        metadataSource: 'EcoRoute Model Registry',
+        metadataLastVerified: new Date('2026-03-01'),
+        methodologyVersion: 'v2',
         performanceJson: JSON.stringify(m.performance),
         environmentalMetricsJson: JSON.stringify(m.env),
         tagsJson: JSON.stringify(m.tags),

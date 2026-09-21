@@ -8,8 +8,18 @@ export const updatePreferencesSchema = z
     costWeight: weightSchema.optional(),
     qualityWeight: weightSchema.optional(),
     environmentalWeight: weightSchema.optional(),
+    latencyWeight: weightSchema.optional(),
+    baselineModelId: z.string().optional().nullable(),
     defaultStrategy: z
-      .enum(['balanced', 'lowest_cost', 'highest_quality', 'eco_first', 'token_efficient'])
+      .enum([
+        'balanced',
+        'lowest_cost',
+        'highest_quality',
+        'eco_first',
+        'token_efficient',
+        'lowest_latency',
+        'quality_first',
+      ])
       .optional(),
   })
   .refine(
@@ -19,14 +29,16 @@ export const updatePreferencesSchema = z
         data.costWeight,
         data.qualityWeight,
         data.environmentalWeight,
+        data.latencyWeight,
       ].filter((w) => w !== undefined);
-      if (weights.length === 4) {
+      if (weights.length === 5) {
         const sum = weights.reduce((a, b) => a + (b ?? 0), 0);
         return Math.abs(sum - 1.0) < 0.01;
       }
       return true;
     },
-    { message: 'When all four weights are provided, they must sum to 1.0' },
+    { message: 'When all five weights are provided, they must sum to 1.0' },
   );
 
 export type UpdatePreferencesInput = z.infer<typeof updatePreferencesSchema>;
+

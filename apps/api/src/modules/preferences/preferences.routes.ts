@@ -5,6 +5,8 @@
 import { FastifyInstance } from 'fastify';
 import { updatePreferencesSchema } from '@ecoroute/validation';
 import { authMiddleware } from '../../middleware/auth.middleware';
+import { encryptSecret, maskApiKey } from '../../lib/crypto';
+import { ProviderHealthService } from '../providers/provider-health.service';
 
 export async function preferencesRoutes(fastify: FastifyInstance) {
   fastify.addHook('preHandler', authMiddleware);
@@ -101,89 +103,118 @@ export async function preferencesRoutes(fastify: FastifyInstance) {
   // GET /api/v1/preferences/api-keys
   fastify.get('/api-keys', async (request, reply) => {
     const providers = await fastify.prisma.aIProvider.findMany({
-      where: { providerKey: { in: ['google_gemini', 'openai', 'anthropic'] } },
+      where: { providerKey: { in: ['google_gemini', 'groq', 'openai', 'anthropic', 'ollama'] } },
     });
 
-    const status: Record<string, boolean> = {
-      google_gemini: Boolean(process.env.GOOGLE_GEMINI_API_KEY),
+    const status: Record<string, any> = {
+      google_gemini: Boolean(process.env.GOOGLE_GEMINI_API_KEY || process.env.GEMINI_API_KEY),
+      groq: Boolean(process.env.GROQ_API_KEY),
+      ollama: true, // Local daemon does not require an API key
       openai: Boolean(process.env.OPENAI_API_KEY),
       anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
+    };
+
+    const details: Record<string, { configured: boolean; maskedKey?: string }> = {
+      google_gemini: { configured: status.google_gemini, maskedKey: maskApiKey(process.env.GOOGLE_GEMINI_API_KEY || process.env.GEMINI_API_KEY) },
+      groq: { configured: status.groq, maskedKey: maskApiKey(process.env.GROQ_API_KEY) },
+      ollama: { configured: true, maskedKey: 'Local Daemon (No API Key Required)' },
+      openai: { configured: status.openai, maskedKey: maskApiKey(process.env.OPENAI_API_KEY) },
+      anthropic: { configured: status.anthropic, maskedKey: maskApiKey(process.env.ANTHROPIC_API_KEY) },
     };
 
     for (const p of providers) {
       if (p.configJson) {
         try {
           const cfg = JSON.parse(p.configJson);
-          if (cfg.apiKey && cfg.apiKey.trim().length > 5) {
+          if (cfg.apiKey && cfg.apiKey.trim().length > 0) {
             status[p.providerKey] = true;
+            details[p.providerKey] = {
+              configured: true,
+              maskedKey: maskApiKey(cfg.apiKey),
+            };
           }
         } catch {}
       }
     }
 
-    return reply.send({ data: status, meta: { requestId: request.id } });
+    return reply.send({
+      data: {
+        ...status,
+        details,
+        freeModelsOnly: process.env.FREE_MODELS_ONLY !== 'false',
+      },
+      meta: { requestId: request.id },
+    });
   });
 
   // PUT /api/v1/preferences/api-keys
   fastify.put('/api-keys', async (request, reply) => {
     const body = (request.body ?? {}) as {
       geminiApiKey?: string;
+      groqApiKey?: string;
       openaiApiKey?: string;
       anthropicApiKey?: string;
+      freeModelsOnly?: boolean;
     };
 
     const updates: Promise<any>[] = [];
 
-    if (body.geminiApiKey !== undefined) {
-      const p = await fastify.prisma.aIProvider.findUnique({ where: { providerKey: 'google_gemini' } });
+    const handleKeyUpdate = async (providerKey: string, providerName: string, rawKey?: string, envVarName?: string) => {
+      if (rawKey === undefined) return;
+      const keyVal = rawKey.trim();
+
+      const p = await fastify.prisma.aIProvider.findUnique({ where: { providerKey } });
       const current = p?.configJson ? JSON.parse(p.configJson) : {};
-      current.apiKey = body.geminiApiKey.trim();
+
+      if (keyVal.length === 0) {
+        // Remove key
+        delete current.apiKey;
+        if (envVarName) delete process.env[envVarName];
+      } else {
+        // Encrypt key at rest
+        current.apiKey = encryptSecret(keyVal);
+        if (envVarName) process.env[envVarName] = keyVal;
+      }
+
       updates.push(
         fastify.prisma.aIProvider.upsert({
-          where: { providerKey: 'google_gemini' },
-          update: { configJson: JSON.stringify(current) },
-          create: { name: 'Google Gemini', providerKey: 'google_gemini', configJson: JSON.stringify(current) },
+          where: { providerKey },
+          update: { configJson: JSON.stringify(current), configurationStatus: keyVal.length > 0 ? 'CONFIGURED' : 'UNCONFIGURED' },
+          create: { name: providerName, providerKey, configJson: JSON.stringify(current), configurationStatus: keyVal.length > 0 ? 'CONFIGURED' : 'UNCONFIGURED' },
         })
       );
-      if (body.geminiApiKey.trim()) {
-        process.env.GOOGLE_GEMINI_API_KEY = body.geminiApiKey.trim();
-      }
+
+      ProviderHealthService.invalidate(providerKey);
+    };
+
+    if (body.geminiApiKey !== undefined) {
+      await handleKeyUpdate('google_gemini', 'Google Gemini', body.geminiApiKey, 'GOOGLE_GEMINI_API_KEY');
+    }
+
+    if (body.groqApiKey !== undefined) {
+      await handleKeyUpdate('groq', 'Groq', body.groqApiKey, 'GROQ_API_KEY');
     }
 
     if (body.openaiApiKey !== undefined) {
-      const p = await fastify.prisma.aIProvider.findUnique({ where: { providerKey: 'openai' } });
-      const current = p?.configJson ? JSON.parse(p.configJson) : {};
-      current.apiKey = body.openaiApiKey.trim();
-      updates.push(
-        fastify.prisma.aIProvider.upsert({
-          where: { providerKey: 'openai' },
-          update: { configJson: JSON.stringify(current) },
-          create: { name: 'OpenAI', providerKey: 'openai', configJson: JSON.stringify(current) },
-        })
-      );
-      if (body.openaiApiKey.trim()) {
-        process.env.OPENAI_API_KEY = body.openaiApiKey.trim();
-      }
+      await handleKeyUpdate('openai', 'OpenAI', body.openaiApiKey, 'OPENAI_API_KEY');
     }
 
     if (body.anthropicApiKey !== undefined) {
-      const p = await fastify.prisma.aIProvider.findUnique({ where: { providerKey: 'anthropic' } });
-      const current = p?.configJson ? JSON.parse(p.configJson) : {};
-      current.apiKey = body.anthropicApiKey.trim();
-      updates.push(
-        fastify.prisma.aIProvider.upsert({
-          where: { providerKey: 'anthropic' },
-          update: { configJson: JSON.stringify(current) },
-          create: { name: 'Anthropic', providerKey: 'anthropic', configJson: JSON.stringify(current) },
-        })
-      );
-      if (body.anthropicApiKey.trim()) {
-        process.env.ANTHROPIC_API_KEY = body.anthropicApiKey.trim();
-      }
+      await handleKeyUpdate('anthropic', 'Anthropic', body.anthropicApiKey, 'ANTHROPIC_API_KEY');
+    }
+
+    if (body.freeModelsOnly !== undefined) {
+      process.env.FREE_MODELS_ONLY = String(body.freeModelsOnly);
     }
 
     await Promise.all(updates);
 
-    return reply.send({ data: { message: 'API keys updated successfully' }, meta: { requestId: request.id } });
+    return reply.send({
+      data: {
+        message: 'Provider API keys updated successfully',
+        freeModelsOnly: process.env.FREE_MODELS_ONLY !== 'false',
+      },
+      meta: { requestId: request.id },
+    });
   });
 }

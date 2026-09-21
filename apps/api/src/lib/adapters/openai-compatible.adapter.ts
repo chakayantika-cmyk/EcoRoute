@@ -13,6 +13,8 @@ import {
   NormalizedGenerationRequest,
   NormalizedGenerationResponse,
 } from './provider-adapter.interface';
+import { ProviderModelUnavailableError } from '../errors';
+import { ProviderHealthService } from '../../modules/providers/provider-health.service';
 
 const PROVIDER_TIMEOUT_MS = 30000;
 
@@ -29,6 +31,9 @@ export class OpenAICompatibleAdapter implements AIProviderAdapter {
     // Resolve base URL
     if (config.baseUrl && config.baseUrl.trim()) {
       this.baseUrl = config.baseUrl.replace(/\/+$/, '');
+      if (config.providerKey === 'ollama' && !this.baseUrl.endsWith('/v1')) {
+        this.baseUrl = `${this.baseUrl}/v1`;
+      }
     } else {
       switch (config.providerKey) {
         case 'groq':
@@ -181,6 +186,14 @@ export class OpenAICompatibleAdapter implements AIProviderAdapter {
 
       if (!res.ok) {
         const errBody = await res.text().catch(() => '');
+        if (res.status === 404 || errBody.toLowerCase().includes('not found')) {
+          ProviderHealthService.invalidate(this.providerKey);
+          throw new ProviderModelUnavailableError(
+            this.providerKey,
+            request.model,
+            `Provider ${this.providerKey} error (404): ${errBody || res.statusText}`,
+          );
+        }
         throw new Error(`Provider ${this.providerKey} error (${res.status}): ${errBody || res.statusText}`);
       }
 
@@ -256,6 +269,14 @@ export class OpenAICompatibleAdapter implements AIProviderAdapter {
 
       if (!res.ok) {
         const errBody = await res.text().catch(() => '');
+        if (res.status === 404 || errBody.toLowerCase().includes('not found')) {
+          ProviderHealthService.invalidate(this.providerKey);
+          throw new ProviderModelUnavailableError(
+            this.providerKey,
+            request.model,
+            `Provider ${this.providerKey} stream error (404): ${errBody || res.statusText}`,
+          );
+        }
         throw new Error(`Provider ${this.providerKey} stream error (${res.status}): ${errBody || res.statusText}`);
       }
 

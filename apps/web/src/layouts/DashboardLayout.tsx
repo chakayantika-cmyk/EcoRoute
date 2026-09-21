@@ -49,11 +49,11 @@ export default function DashboardLayout() {
             </Link>
           </div>
 
-          {/* Mock Mode Banner */}
+          {/* Explicit Mock Mode Banner (Simulation only) */}
           {isMockMode && (
             <div className="mx-4 mt-4 p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800">
-              <p className="text-caption text-amber-700 dark:text-amber-400 font-medium">Mock Mode</p>
-              <p className="text-caption text-amber-600 dark:text-amber-500">No API keys configured</p>
+              <p className="text-caption text-amber-700 dark:text-amber-400 font-medium">Simulation Mode Active</p>
+              <p className="text-caption text-amber-600 dark:text-amber-500">AI_MOCK_MODE=true enabled</p>
             </div>
           )}
 

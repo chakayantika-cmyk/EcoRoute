@@ -19,6 +19,8 @@ export interface ProviderCallResult {
   latencyMs: number;
 }
 
+import { decryptSecret } from './crypto';
+
 export interface ModelContext {
   modelKey: string;
   displayName: string;
@@ -39,8 +41,9 @@ export interface ModelContext {
  * Validates whether credentials exist for a given provider
  */
 export function isProviderConfigured(providerKey: string, apiKeyOverride?: string): boolean {
-  if (apiKeyOverride && apiKeyOverride.trim().length > 0) return true;
-  if (providerKey === 'ollama' || providerKey === 'mock') return true;
+  if (apiKeyOverride && decryptSecret(apiKeyOverride).trim().length > 0) return true;
+  if (providerKey === 'ollama') return true;
+  if (providerKey === 'mock') return process.env.AI_MOCK_MODE === 'true';
 
   switch (providerKey) {
     case 'openai':
@@ -48,7 +51,10 @@ export function isProviderConfigured(providerKey: string, apiKeyOverride?: strin
     case 'anthropic':
       return Boolean(process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY.trim().length > 0);
     case 'google_gemini':
-      return Boolean(process.env.GOOGLE_GEMINI_API_KEY && process.env.GOOGLE_GEMINI_API_KEY.trim().length > 0);
+      return Boolean(
+        (process.env.GOOGLE_GEMINI_API_KEY && process.env.GOOGLE_GEMINI_API_KEY.trim().length > 0) ||
+        (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim().length > 0)
+      );
     case 'groq':
       return Boolean(process.env.GROQ_API_KEY && process.env.GROQ_API_KEY.trim().length > 0);
     case 'deepseek':
@@ -75,6 +81,13 @@ export async function executeModelCall(
   const isMockModel = model.providerKey === 'mock';
 
   // Explicit Mock Mode Handling
+  if (isMockModel && !isMockModeExplicit) {
+    throw new ProviderNotConfiguredError(
+      model.providerName,
+      `AI provider "${model.providerName}" is a mock simulation model and is disabled in production (AI_MOCK_MODE=false). Please configure a real AI provider in Settings.`,
+    );
+  }
+
   if (isMockModeExplicit || isMockModel) {
     const mockAdapter = AdapterFactory.getAdapter({
       id: 'mock-provider',
@@ -121,6 +134,9 @@ export async function executeModelCall(
     );
   }
 
+  // Decrypt secret if encrypted
+  const decryptedApiKey = apiKeyOverride ? decryptSecret(apiKeyOverride) : undefined;
+
   // Execute with the real provider adapter
   try {
     const adapterType =
@@ -137,7 +153,7 @@ export async function executeModelCall(
       name: model.providerName,
       adapterType,
       baseUrl: model.baseUrl,
-      apiKey: apiKeyOverride,
+      apiKey: decryptedApiKey,
       enabled: true,
     });
 
@@ -185,6 +201,13 @@ export async function streamModelCall(
 ): Promise<ProviderCallResult> {
   const isMockModeExplicit = process.env.AI_MOCK_MODE === 'true';
   const isMockModel = model.providerKey === 'mock';
+
+  if (isMockModel && !isMockModeExplicit) {
+    throw new ProviderNotConfiguredError(
+      model.providerName,
+      `AI provider "${model.providerName}" is a mock simulation model and is disabled in production (AI_MOCK_MODE=false). Please configure a real AI provider in Settings.`,
+    );
+  }
 
   if (isMockModeExplicit || isMockModel) {
     const mockAdapter = AdapterFactory.getAdapter({
@@ -235,6 +258,8 @@ export async function streamModelCall(
     );
   }
 
+  const decryptedApiKey = apiKeyOverride ? decryptSecret(apiKeyOverride) : undefined;
+
   const adapterType =
     model.adapterType ||
     (model.providerKey === 'anthropic'
@@ -249,7 +274,7 @@ export async function streamModelCall(
     name: model.providerName,
     adapterType,
     baseUrl: model.baseUrl,
-    apiKey: apiKeyOverride,
+    apiKey: decryptedApiKey,
     enabled: true,
   });
 

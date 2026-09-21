@@ -5,6 +5,8 @@
 import { FastifyInstance } from 'fastify';
 import { authMiddleware, adminMiddleware } from '../../middleware/auth.middleware';
 import { AdapterFactory } from '../../lib/adapters/adapter-factory';
+import { ProviderHealthService } from './provider-health.service';
+import { KNOWN_MODEL_PRICING } from '@ecoroute/config';
 
 export async function providersRoutes(fastify: FastifyInstance) {
   // Public or Auth-Protected Provider Routes
@@ -200,6 +202,66 @@ export async function providersRoutes(fastify: FastifyInstance) {
 
     return reply.send({
       data: result,
+      meta: { requestId: request.id },
+    });
+  });
+
+  // POST /api/v1/providers/:providerKey/test — Probe provider health and discover available models
+  fastify.post('/:providerKey/test', async (request, reply) => {
+    const { providerKey } = request.params as { providerKey: string };
+    const provider = await fastify.prisma.aIProvider.findFirst({
+      where: {
+        OR: [{ providerKey }, { id: providerKey }],
+      },
+      include: {
+        models: true,
+      },
+    });
+
+    if (!provider) {
+      return reply.status(404).send({
+        error: { code: 'NOT_FOUND', message: `Provider '${providerKey}' not found`, requestId: request.id },
+      });
+    }
+
+    let apiKey: string | undefined;
+    if (provider.configJson) {
+      try {
+        const cfg = JSON.parse(provider.configJson);
+        apiKey = cfg.apiKey;
+      } catch {}
+    }
+
+    const health = await ProviderHealthService.getProviderHealth(
+      provider.providerKey,
+      provider.baseUrl,
+      apiKey,
+      true // force fresh probe
+    );
+
+    // Count catalog free models vs total models
+    let freeModelsCount = 0;
+    for (const m of provider.models) {
+      const known = KNOWN_MODEL_PRICING[m.modelKey] || KNOWN_MODEL_PRICING[m.providerModelId || ''];
+      if (known?.pricingTier === 'free' || provider.providerKey === 'ollama') {
+        freeModelsCount++;
+      }
+    }
+
+    return reply.send({
+      data: {
+        providerKey: provider.providerKey,
+        name: provider.name,
+        configured: health.configured,
+        reachable: health.reachable,
+        authenticated: health.authenticated,
+        status: health.status,
+        errorMessage: health.errorMessage || null,
+        discoveredModelsCount: health.availableModels.size,
+        catalogModelsCount: provider.models.length,
+        freeModelsCount,
+        lastCheckedAt: new Date(health.lastCheckedAt).toISOString(),
+      },
       meta: { requestId: request.id },
     });
   });

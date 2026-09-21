@@ -3,110 +3,28 @@
 // ============================================================================
 
 import { useState, useRef, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { tasksService } from '../services/tasks';
 import { EXAMPLE_PROMPTS, ROUTING_STRATEGY_LABELS } from '@ecoroute/config';
 import {
   Send, Loader2, Sparkles, RotateCcw, ChevronDown, Leaf,
-  Zap, DollarSign, Brain, BarChart3, AlertTriangle, Info, Compass,
-  BookOpen, Square, CheckCircle2, ShieldAlert, Bug, Award
+  Zap, DollarSign, Brain, AlertTriangle, Info, Compass,
+  Square, CheckCircle2, Bug, Award, Droplets, ShieldCheck, Key
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  RadarChart, PolarGrid, PolarAngleAxis, Radar, Cell, ScatterChart,
-  Scatter, ZAxis, CartesianGrid,
+  RadarChart, PolarGrid, PolarAngleAxis, Radar, Cell,
 } from 'recharts';
 
-export type TaskStatus =
-  | 'idle'
-  | 'analyzing'
-  | 'evaluating'
-  | 'routing'
-  | 'generating'
-  | 'completed'
-  | 'error';
-
-export interface EvaluatedModel {
-  modelId: string;
-  modelKey: string;
-  modelName: string;
-  providerKey: string;
-  providerName: string;
-  family: string;
-  capabilities: string[];
-  contextWindow: number;
-  eligible: boolean;
-  disqualifyReason?: string;
-  estimatedTokens: number;
-  estimatedCost: number | null;
-  estimatedCarbon: number | null;
-  qualityScore: number;
-  qualitySource?: string;
-  latencyMs: number | null;
-  routingScore: number;
-  breakdown: {
-    quality: number;
-    cost: number;
-    tokenEfficiency: number;
-    environmental: number;
-  };
-  status: 'evaluated' | 'ineligible';
-  isSelected?: boolean;
-}
-
-export interface TaskAnalysisData {
-  domain: string;
-  domainLabel: string;
-  complexityIndex: number;
-  complexityTier: string;
-  reasoningDepth: number;
-  constraintDensity: number;
-  lexicalDiversity: number;
-  wordCount: number;
-  inputTokens: number;
-  predictedOutputTokens: number;
-  expansionRatio: number;
-  totalEstimatedTokens: number;
-  detectedFeatures: string[];
-}
-
-export interface StreamedResult {
-  taskId: string;
-  inputText: string;
-  taskAnalysis?: TaskAnalysisData;
-  evaluations: EvaluatedModel[];
-  selectedModel?: {
-    modelId: string;
-    modelKey: string;
-    displayName: string;
-    provider: string;
-    routingScore: number;
-    breakdown: {
-      quality: number;
-      cost: number;
-      tokenEfficiency: number;
-      environmental: number;
-    };
-    estimatedCost: number | null;
-    estimatedCarbon: number | null;
-    estimatedTokens: number;
-    qualityScore: number;
-    estimatedLatencyMs?: number | null;
-  };
-  streamedAnswer: string;
-  explanation?: string;
-  actualUsage?: {
-    inputTokens?: number;
-    outputTokens?: number;
-    totalTokens?: number;
-    latencyMs?: number;
-    actualCost?: number | null;
-  };
-  errorInfo?: {
-    code: string;
-    message: string;
-    provider?: string;
-  };
-}
+import {
+  TaskStatus,
+  StreamedResult,
+} from './dashboard.types';
+import {
+  buildRoutingScoreChartData,
+  buildCostChartData,
+  buildCarbonChartData,
+} from './dashboard.utils';
 
 export default function DashboardPage() {
   const [inputText, setInputText] = useState('');
@@ -180,12 +98,20 @@ export default function DashboardPage() {
               setResult((prev) => (prev ? { ...prev, taskAnalysis: data } : null));
               break;
 
+            case 'baseline':
+              setResult((prev) => (prev ? { ...prev, baseline: data } : null));
+              break;
+
             case 'evaluations':
               setResult((prev) => (prev ? { ...prev, evaluations: data } : null));
               break;
 
             case 'selectedModel':
               setResult((prev) => (prev ? { ...prev, selectedModel: data } : null));
+              break;
+
+            case 'sustainability':
+              setResult((prev) => (prev ? { ...prev, sustainability: data } : null));
               break;
 
             case 'chunk':
@@ -203,6 +129,10 @@ export default function DashboardPage() {
                       ...prev,
                       actualUsage: data.actualUsage,
                       explanation: data.explanation,
+                      baseline: data.baseline || prev.baseline,
+                      sustainability: data.sustainability || prev.sustainability,
+                      routingPerformed: data.routingPerformed ?? prev.routingPerformed,
+                      bypassReason: data.bypassReason || prev.bypassReason,
                     }
                   : null
               );
@@ -219,6 +149,7 @@ export default function DashboardPage() {
                         code: data.code || 'ROUTING_ERROR',
                         message: data.message || 'Routing error occurred',
                         provider: data.provider,
+                        providerSummaries: data.providerSummaries || data.details?.providerSummaries,
                       },
                     }
                   : null
@@ -263,19 +194,19 @@ export default function DashboardPage() {
     status === 'analyzing' || status === 'evaluating' || status === 'routing' || status === 'generating';
 
   return (
-    <div className="p-6 lg:p-8 max-w-7xl mx-auto">
+    <div className="p-6 lg:p-8 max-w-7xl mx-auto space-y-8">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="page-title mb-2">EcoRoute AI Router</h1>
           <p className="text-body text-eco-text-secondary dark:text-dark-text-secondary">
-            Two-stage dynamic AI routing: rapid multi-model Pareto evaluation followed by single-model live execution.
+            Production-quality, data-driven AI model routing with full router overhead accounting and counterfactual baseline comparison.
           </p>
         </div>
         <div className="flex items-center gap-2">
           <button
             onClick={() => setShowDebugger(!showDebugger)}
-            className={`btn-ghost text-caption flex items-center gap-1.5 px-3 py-1.5 border rounded-lg ${
+            className={`btn-ghost text-caption flex items-center gap-1.5 px-3 py-1.5 border rounded-lg transition-colors ${
               showDebugger ? 'bg-brand-50 border-brand-300 dark:bg-brand-900/30 dark:border-brand-700' : 'border-eco-border dark:border-dark-border'
             }`}
           >
@@ -287,7 +218,7 @@ export default function DashboardPage() {
 
       {/* Task Composer */}
       {status === 'idle' && !result?.streamedAnswer && (
-        <div className="card mb-8 animate-fade-in shadow-sm">
+        <div className="card animate-fade-in shadow-sm">
           <div className="flex items-center justify-between mb-4">
             <h2 className="font-serif text-heading-3 text-eco-text dark:text-dark-text">Task Composer</h2>
             <button
@@ -359,14 +290,14 @@ export default function DashboardPage() {
           </div>
 
           <div className="mt-2 text-caption text-eco-text-secondary dark:text-dark-text-secondary">
-            {inputText.length} / 10,000 characters · Inexpensive local evaluation across all models → Only winner executes.
+            {inputText.length} / 10,000 characters · Inexpensive local evaluation across all models → Only winning model executes.
           </div>
         </div>
       )}
 
       {/* Progress & State Indicator */}
       {isRunning && (
-        <div className="card mb-8 border-brand-300 dark:border-brand-700 bg-brand-50/30 dark:bg-brand-950/20 animate-fade-in">
+        <div className="card border-brand-300 dark:border-brand-700 bg-brand-50/30 dark:bg-brand-950/20 animate-fade-in">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-xl bg-brand-600 text-white flex items-center justify-center flex-shrink-0 animate-pulse">
@@ -397,7 +328,7 @@ export default function DashboardPage() {
 
       {/* Error Banner */}
       {status === 'error' && result?.errorInfo && (
-        <div className="card border-red-300 dark:border-red-800 bg-red-50/70 dark:bg-red-900/20 mb-8 animate-shake">
+        <div className="card border-red-300 dark:border-red-800 bg-red-50/70 dark:bg-red-900/20 animate-shake">
           <div className="flex items-start gap-3">
             <AlertTriangle className="w-6 h-6 text-red-600 flex-shrink-0 mt-0.5" />
             <div className="flex-1">
@@ -411,10 +342,56 @@ export default function DashboardPage() {
                   </span>
                 )}
               </div>
-              <h3 className="font-serif text-heading-3 text-red-900 dark:text-red-200 mb-2">Execution Failed</h3>
-              <p className="text-body text-red-800 dark:text-red-300 mb-4">{result.errorInfo.message}</p>
-              <div className="flex items-center gap-3">
-                <button onClick={handleSubmit} className="btn-primary bg-red-600 hover:bg-red-700 text-white">
+              <h3 className="font-serif text-heading-3 text-red-900 dark:text-red-200 mb-2">
+                {result.errorInfo.code === 'NO_AI_PROVIDER_CONFIGURED'
+                  ? 'No AI Provider Configured'
+                  : result.errorInfo.code === 'NO_ELIGIBLE_FREE_MODEL'
+                  ? 'No Free Models Currently Eligible'
+                  : 'Execution Failed'}
+              </h3>
+
+              {result.errorInfo.providerSummaries && result.errorInfo.providerSummaries.length > 0 ? (
+                <div className="my-3 space-y-2">
+                  <p className="text-body-sm text-red-800 dark:text-red-300 font-medium">
+                    No free models could execute this task. Here is the current status across providers:
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
+                    {result.errorInfo.providerSummaries.map((p) => (
+                      <div
+                        key={p.providerKey}
+                        className="p-2.5 rounded-lg border border-red-200 dark:border-red-900/60 bg-white/70 dark:bg-slate-900/60 flex flex-col justify-between"
+                      >
+                        <div className="flex items-center justify-between text-caption font-semibold text-eco-text dark:text-dark-text">
+                          <span>{p.providerName}</span>
+                          <span
+                            className={`px-1.5 py-0.5 rounded text-[11px] font-mono ${
+                              p.availableCount > 0
+                                ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200'
+                                : 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200'
+                            }`}
+                          >
+                            {p.availableCount > 0 ? `${p.availableCount} Ready` : 'Unavailable'}
+                          </span>
+                        </div>
+                        <p className="text-caption text-eco-text-secondary dark:text-dark-text-secondary mt-1">
+                          {p.statusSummary}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-caption text-eco-text-secondary dark:text-dark-text-secondary pt-1">
+                    Check the Routing Debugger below for granular diagnostics on every model in the catalog.
+                  </p>
+                </div>
+              ) : (
+                <p className="text-body text-red-800 dark:text-red-300 mb-4 whitespace-pre-line">{result.errorInfo.message}</p>
+              )}
+
+              <div className="flex items-center gap-3 mt-4">
+                <Link to="/settings" className="btn-primary flex items-center gap-1.5">
+                  <Key className="w-4 h-4" /> Configure Providers in Settings
+                </Link>
+                <button onClick={handleSubmit} className="btn-secondary">
                   Retry Execution
                 </button>
                 <button onClick={handleRouteAnother} className="btn-secondary">
@@ -428,7 +405,7 @@ export default function DashboardPage() {
 
       {/* Live Streamed Answer Area */}
       {(result?.streamedAnswer || status === 'generating' || status === 'completed') && (
-        <div className="card mb-8 border-brand-200 dark:border-brand-800 shadow-sm animate-slide-up">
+        <div className="card border-brand-200 dark:border-brand-800 shadow-sm animate-slide-up">
           <div className="flex items-center justify-between mb-4 border-b border-eco-border dark:border-dark-border pb-3">
             <div className="flex items-center gap-2">
               <span className="badge-success flex items-center gap-1">
@@ -438,6 +415,11 @@ export default function DashboardPage() {
               <span className="text-caption text-eco-text-secondary dark:text-dark-text-secondary">
                 by {result?.selectedModel?.provider ?? 'Provider'}
               </span>
+              {result?.routingPerformed === false && (
+                <span className="badge-warning text-caption font-semibold">
+                  Direct Baseline Bypass
+                </span>
+              )}
             </div>
 
             <div className="flex items-center gap-2">
@@ -464,6 +446,207 @@ export default function DashboardPage() {
         </div>
       )}
 
+      {/* Net Outcome Card (Zero-Greenwashing & Break-Even Evaluation) */}
+      {result?.sustainability && (
+        <div className="animate-slide-up">
+          <NetOutcomeCard
+            outcomeStatus={result.sustainability.outcomeStatus}
+            outcomeMessage={result.sustainability.outcomeMessage}
+            routingPerformed={result.routingPerformed ?? true}
+            bypassReason={result.bypassReason}
+            netCarbonGrams={result.sustainability.netSavings.carbonGramsCo2e}
+            netCarbonPct={result.sustainability.netSavings.carbonPercent}
+            netCostUsd={result.sustainability.netSavings.costUsd}
+            netCostPct={result.sustainability.netSavings.costPercent}
+          />
+        </div>
+      )}
+
+      {/* 4-Column Sustainability Accounting Table */}
+      {result?.sustainability && (
+        <div className="card shadow-sm animate-slide-up">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-4 border-b border-eco-border dark:border-dark-border pb-3">
+            <div>
+              <h3 className="font-serif text-heading-3 text-eco-text dark:text-dark-text flex items-center gap-2">
+                <ShieldCheck className="w-5 h-5 text-brand-600 dark:text-brand-400" />
+                Comprehensive Sustainability Accounting
+              </h3>
+              <p className="text-caption text-eco-text-secondary dark:text-dark-text-secondary">
+                Auditable four-column balance sheet accounting for router overhead against the counterfactual baseline.
+              </p>
+            </div>
+            <span className="text-caption text-eco-text-secondary dark:text-dark-text-secondary bg-eco-surface-alt dark:bg-dark-surface-alt px-2.5 py-1 rounded border border-eco-border dark:border-dark-border">
+              Baseline: {result.baseline?.displayName || 'Direct Baseline'} (Counterfactual)
+            </span>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-body-sm border-collapse">
+              <thead>
+                <tr className="border-b border-eco-border dark:border-dark-border text-caption font-semibold uppercase text-eco-text-secondary dark:text-dark-text-secondary bg-eco-surface-alt dark:bg-dark-surface-alt">
+                  <th className="py-3 px-4">Resource / Dimension</th>
+                  <th className="py-3 px-4">Direct Baseline</th>
+                  <th className="py-3 px-4">Routing Overhead</th>
+                  <th className="py-3 px-4">EcoRoute Total</th>
+                  <th className="py-3 px-4 text-right">Net Impact (Savings)</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-eco-border dark:divide-dark-border font-mono text-caption">
+                {/* Cost Row */}
+                <tr className="hover:bg-eco-surface dark:hover:bg-dark-surface-2">
+                  <td className="py-3 px-4 font-sans font-medium text-eco-text dark:text-dark-text flex items-center gap-1.5">
+                    <DollarSign className="w-3.5 h-3.5 text-brand-600" /> Cost ($ USD)
+                  </td>
+                  <td className="py-3 px-4">
+                    ${result.sustainability.baseline.costUsd != null ? result.sustainability.baseline.costUsd.toFixed(6) : '—'}
+                  </td>
+                  <td className="py-3 px-4">
+                    ${result.sustainability.router.costUsd != null ? result.sustainability.router.costUsd.toFixed(6) : '0.000000'}
+                    <span className="text-[10px] text-eco-text-secondary block font-sans">CPU energy cost</span>
+                  </td>
+                  <td className="py-3 px-4 font-semibold text-eco-text dark:text-dark-text">
+                    ${result.sustainability.ecoRouteTotal.costUsd != null ? result.sustainability.ecoRouteTotal.costUsd.toFixed(6) : '—'}
+                  </td>
+                  <td className="py-3 px-4 text-right">
+                    {(() => {
+                      const saved = result.sustainability.netSavings.costUsd;
+                      const pct = result.sustainability.netSavings.costPercent;
+                      if (saved == null) return <span className="font-sans text-eco-text-secondary italic">Unavailable</span>;
+                      const isFavorable = saved >= 0;
+                      return (
+                        <span className={`px-2 py-0.5 rounded font-bold ${
+                          isFavorable
+                            ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300'
+                            : 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
+                        }`}>
+                          {isFavorable ? '▼ ' : '▲ +'}
+                          {Math.abs(pct ?? 0).toFixed(1)}% (${Math.abs(saved).toFixed(6)})
+                        </span>
+                      );
+                    })()}
+                  </td>
+                </tr>
+
+                {/* Energy Row */}
+                <tr className="hover:bg-eco-surface dark:hover:bg-dark-surface-2">
+                  <td className="py-3 px-4 font-sans font-medium text-eco-text dark:text-dark-text flex items-center gap-1.5">
+                    <Zap className="w-3.5 h-3.5 text-amber-600" /> Energy (Wh)
+                  </td>
+                  <td className="py-3 px-4">
+                    {result.sustainability.baseline.energyWh != null ? `${result.sustainability.baseline.energyWh.toFixed(4)} Wh` : '—'}
+                  </td>
+                  <td className="py-3 px-4">
+                    {result.sustainability.router.energyWh != null ? `${result.sustainability.router.energyWh.toFixed(4)} Wh` : '—'}
+                    <span className="text-[10px] text-eco-text-secondary block font-sans">{(result.sustainability.router.latencyMs ?? 0).toFixed(0)}ms wall-clock</span>
+                  </td>
+                  <td className="py-3 px-4 font-semibold text-eco-text dark:text-dark-text">
+                    {result.sustainability.ecoRouteTotal.energyWh != null ? `${result.sustainability.ecoRouteTotal.energyWh.toFixed(4)} Wh` : '—'}
+                  </td>
+                  <td className="py-3 px-4 text-right">
+                    {(() => {
+                      const saved = result.sustainability.netSavings.energyWh;
+                      const pct = result.sustainability.netSavings.energyPercent;
+                      if (saved == null) return <span className="font-sans text-eco-text-secondary italic">Unavailable</span>;
+                      const isFavorable = saved >= 0;
+                      return (
+                        <span className={`px-2 py-0.5 rounded font-bold ${
+                          isFavorable
+                            ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300'
+                            : 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
+                        }`}>
+                          {isFavorable ? '▼ ' : '▲ +'}
+                          {Math.abs(pct ?? 0).toFixed(1)}% ({Math.abs(saved).toFixed(4)} Wh)
+                        </span>
+                      );
+                    })()}
+                  </td>
+                </tr>
+
+                {/* Carbon Row */}
+                <tr className="hover:bg-eco-surface dark:hover:bg-dark-surface-2">
+                  <td className="py-3 px-4 font-sans font-medium text-eco-text dark:text-dark-text flex items-center gap-1.5">
+                    <Leaf className="w-3.5 h-3.5 text-emerald-600" /> Carbon (g CO₂e)
+                  </td>
+                  <td className="py-3 px-4">
+                    {result.sustainability.baseline.carbonGramsCo2e != null ? `${result.sustainability.baseline.carbonGramsCo2e.toFixed(4)} g` : '—'}
+                  </td>
+                  <td className="py-3 px-4">
+                    {result.sustainability.router.carbonGramsCo2e != null ? `${result.sustainability.router.carbonGramsCo2e.toFixed(4)} g` : '—'}
+                    <span className="text-[10px] text-eco-text-secondary block font-sans">Local grid mix</span>
+                  </td>
+                  <td className="py-3 px-4 font-semibold text-eco-text dark:text-dark-text">
+                    {result.sustainability.ecoRouteTotal.carbonGramsCo2e != null ? `${result.sustainability.ecoRouteTotal.carbonGramsCo2e.toFixed(4)} g` : '—'}
+                  </td>
+                  <td className="py-3 px-4 text-right">
+                    {(() => {
+                      const saved = result.sustainability.netSavings.carbonGramsCo2e;
+                      const pct = result.sustainability.netSavings.carbonPercent;
+                      if (saved == null) return <span className="font-sans text-eco-text-secondary italic">Unavailable</span>;
+                      const isFavorable = saved >= 0;
+                      return (
+                        <span className={`px-2 py-0.5 rounded font-bold ${
+                          isFavorable
+                            ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300'
+                            : 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
+                        }`}>
+                          {isFavorable ? '▼ ' : '▲ +'}
+                          {Math.abs(pct ?? 0).toFixed(1)}% ({Math.abs(saved).toFixed(4)} g)
+                        </span>
+                      );
+                    })()}
+                  </td>
+                </tr>
+
+                {/* Water Row (Strict Null Safety) */}
+                <tr className="hover:bg-eco-surface dark:hover:bg-dark-surface-2">
+                  <td className="py-3 px-4 font-sans font-medium text-eco-text dark:text-dark-text flex items-center gap-1.5">
+                    <Droplets className="w-3.5 h-3.5 text-cyan-600" /> Water Consumption (L)
+                  </td>
+                  <td className="py-3 px-4">
+                    {result.sustainability.baseline.waterLiters != null
+                      ? `${result.sustainability.baseline.waterLiters.toFixed(4)} L`
+                      : <span className="font-sans text-eco-text-secondary italic">Unavailable</span>}
+                  </td>
+                  <td className="py-3 px-4">
+                    {result.sustainability.router.waterLiters != null
+                      ? `${result.sustainability.router.waterLiters.toFixed(4)} L`
+                      : <span className="font-sans text-eco-text-secondary italic">Unavailable</span>}
+                  </td>
+                  <td className="py-3 px-4 font-semibold text-eco-text dark:text-dark-text">
+                    {result.sustainability.ecoRouteTotal.waterLiters != null
+                      ? `${result.sustainability.ecoRouteTotal.waterLiters.toFixed(4)} L`
+                      : <span className="font-sans text-eco-text-secondary italic">Unavailable</span>}
+                  </td>
+                  <td className="py-3 px-4 text-right">
+                    {(() => {
+                      const saved = result.sustainability.netSavings.waterLiters;
+                      const pct = result.sustainability.netSavings.waterPercent;
+                      if (saved == null) return <span className="font-sans text-eco-text-secondary italic text-caption">Unavailable</span>;
+                      const isFavorable = saved >= 0;
+                      return (
+                        <span className={`px-2 py-0.5 rounded font-bold ${
+                          isFavorable
+                            ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300'
+                            : 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
+                        }`}>
+                          {isFavorable ? '▼ ' : '▲ +'}
+                          {Math.abs(pct ?? 0).toFixed(1)}% ({Math.abs(saved).toFixed(4)} L)
+                        </span>
+                      );
+                    })()}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div className="mt-3 text-[11px] text-eco-text-secondary dark:text-dark-text-secondary flex flex-col sm:flex-row justify-between gap-2 border-t border-eco-border dark:border-dark-border pt-2">
+            <span>* Direct Baseline is a counterfactual estimate without second provider execution. Only one live generation executed.</span>
+            <span>** Water intensity data is labeled Unavailable where regional datacenter water consumption benchmarks are uncertified.</span>
+          </div>
+        </div>
+      )}
+
       {/* Post-Routing Analytics: Recommendations, Comparison, Charts */}
       {result && result.evaluations && result.evaluations.length > 0 && (
         <div className="space-y-8 animate-slide-up">
@@ -474,7 +657,7 @@ export default function DashboardPage() {
                 <div>
                   <div className="flex items-center gap-2 mb-1.5">
                     <span className="px-2.5 py-0.5 rounded-full text-caption font-bold bg-brand-600 text-white flex items-center gap-1">
-                      <Award className="w-3.5 h-3.5" /> EcoRoute Recommendation
+                      <Award className="w-3.5 h-3.5" /> EcoRoute Selection
                     </span>
                     <span className="px-2.5 py-0.5 rounded-full text-caption bg-brand-100 text-brand-800 dark:bg-brand-900/50 dark:text-brand-200">
                       Score: {result.selectedModel.routingScore}%
@@ -533,38 +716,49 @@ export default function DashboardPage() {
                       : 'Unavailable'
                   }
                   status="estimated"
-                  tooltip="Modeled dual-phase prefill/decode sequence-length estimate"
+                  tooltip="Dual-phase prefill/decode sequence-length estimate"
                 />
               </div>
 
-              {/* Why was this model selected? Breakdown */}
+              {/* 5-Dimensional Decision-Ranking Breakdown */}
               <div className="p-4 rounded-xl bg-eco-surface dark:bg-dark-bg border border-eco-border dark:border-dark-border">
-                <h4 className="font-serif text-heading-4 text-eco-text dark:text-dark-text mb-3">
-                  Why was this model selected? (Routing Score Breakdown)
-                </h4>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-caption">
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="font-serif text-heading-4 text-eco-text dark:text-dark-text">
+                    Routing Decision-Ranking Breakdown (Weights Σ = 1.0)
+                  </h4>
+                  <span className="text-[11px] text-eco-text-secondary dark:text-dark-text-secondary">
+                    * Decision ranking metric only; not equivalent to resource savings.
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-caption">
                   <div className="p-2.5 rounded-lg bg-eco-surface-alt dark:bg-dark-surface-alt border border-eco-border dark:border-dark-border">
-                    <span className="text-eco-text-secondary dark:text-dark-text-secondary block">Quality Contribution</span>
+                    <span className="text-eco-text-secondary dark:text-dark-text-secondary block">Quality</span>
                     <span className="font-mono font-bold text-body-sm text-brand-600 dark:text-brand-400">
                       {result.selectedModel.breakdown.quality} pts
                     </span>
                   </div>
                   <div className="p-2.5 rounded-lg bg-eco-surface-alt dark:bg-dark-surface-alt border border-eco-border dark:border-dark-border">
-                    <span className="text-eco-text-secondary dark:text-dark-text-secondary block">Cost Efficiency</span>
+                    <span className="text-eco-text-secondary dark:text-dark-text-secondary block">Cost Eff.</span>
                     <span className="font-mono font-bold text-body-sm text-brand-600 dark:text-brand-400">
                       {result.selectedModel.breakdown.cost} pts
                     </span>
                   </div>
                   <div className="p-2.5 rounded-lg bg-eco-surface-alt dark:bg-dark-surface-alt border border-eco-border dark:border-dark-border">
-                    <span className="text-eco-text-secondary dark:text-dark-text-secondary block">Token Efficiency</span>
+                    <span className="text-eco-text-secondary dark:text-dark-text-secondary block">Token Eff.</span>
                     <span className="font-mono font-bold text-body-sm text-brand-600 dark:text-brand-400">
                       {result.selectedModel.breakdown.tokenEfficiency} pts
                     </span>
                   </div>
                   <div className="p-2.5 rounded-lg bg-eco-surface-alt dark:bg-dark-surface-alt border border-eco-border dark:border-dark-border">
-                    <span className="text-eco-text-secondary dark:text-dark-text-secondary block">Eco Efficiency</span>
+                    <span className="text-eco-text-secondary dark:text-dark-text-secondary block">Eco Eff.</span>
                     <span className="font-mono font-bold text-body-sm text-brand-600 dark:text-brand-400">
                       {result.selectedModel.breakdown.environmental} pts
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-eco-surface-alt dark:bg-dark-surface-alt border border-eco-border dark:border-dark-border">
+                    <span className="text-eco-text-secondary dark:text-dark-text-secondary block">Latency</span>
+                    <span className="font-mono font-bold text-body-sm text-brand-600 dark:text-brand-400">
+                      {result.selectedModel.breakdown.latency} pts
                     </span>
                   </div>
                 </div>
@@ -651,7 +845,7 @@ export default function DashboardPage() {
                   All Models Comparison
                 </h3>
                 <p className="text-caption text-eco-text-secondary dark:text-dark-text-secondary">
-                  Showing all {result.evaluations.length} models evaluated in Stage 1. Only the selected model was executed.
+                  Showing all {result.evaluations.length} models evaluated in Stage 1. Only the selected model executed.
                 </p>
               </div>
             </div>
@@ -662,10 +856,14 @@ export default function DashboardPage() {
                   <tr className="border-b border-eco-border dark:border-dark-border text-caption font-semibold uppercase text-eco-text-secondary dark:text-dark-text-secondary bg-eco-surface-alt dark:bg-dark-surface-alt">
                     <th className="py-3 px-4">Model</th>
                     <th className="py-3 px-3">Provider</th>
-                    <th className="py-3 px-3">Eligibility</th>
+                    <th className="py-3 px-3">Pricing Tier</th>
+                    <th className="py-3 px-3">Status</th>
+                    <th className="py-3 px-3">Availability</th>
+                    <th className="py-3 px-3 text-center">Called?</th>
                     <th className="py-3 px-3">Est. Tokens</th>
                     <th className="py-3 px-3">Est. Cost</th>
                     <th className="py-3 px-3">Est. Carbon</th>
+                    <th className="py-3 px-3">Est. Water</th>
                     <th className="py-3 px-3">Quality</th>
                     <th className="py-3 px-3">Latency</th>
                     <th className="py-3 px-4 text-right">Routing Score</th>
@@ -674,6 +872,7 @@ export default function DashboardPage() {
                 <tbody className="divide-y divide-eco-border dark:divide-dark-border">
                   {result.evaluations.map((model) => {
                     const isWinner = model.isSelected || model.modelId === result.selectedModel?.modelId;
+                    const wasActuallyCalled = model.wasCalled ?? isWinner;
                     return (
                       <tr
                         key={model.modelId}
@@ -682,38 +881,140 @@ export default function DashboardPage() {
                         }`}
                       >
                         <td className="py-3 px-4">
-                          <div className="flex items-center gap-2">
-                            <span>{model.modelName}</span>
-                            {isWinner && (
-                              <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-brand-600 text-white flex items-center gap-0.5">
-                                Selected by EcoRoute
+                          <div className="flex flex-col">
+                            <div className="flex items-center gap-2">
+                              <span className="font-medium text-eco-text dark:text-dark-text">{model.modelName}</span>
+                              {isWinner && (
+                                <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-brand-600 text-white flex items-center gap-0.5">
+                                  Selected
+                                </span>
+                              )}
+                            </div>
+                            {model.family && (
+                              <span className="text-[10px] text-eco-text-secondary dark:text-dark-text-secondary">
+                                {model.family}
                               </span>
                             )}
                           </div>
                         </td>
                         <td className="py-3 px-3 text-caption text-eco-text-secondary dark:text-dark-text-secondary">
-                          {model.providerName}
+                          <div className="flex items-center gap-1.5">
+                            <span>{model.providerName}</span>
+                            {model.providerHealth === 'UNREACHABLE' && (
+                              <span className="w-2 h-2 rounded-full bg-red-500 flex-shrink-0" title="Provider unreachable" />
+                            )}
+                            {model.providerHealth === 'HEALTHY' && (
+                              <span className="w-2 h-2 rounded-full bg-emerald-500 flex-shrink-0" title="Provider reachable & verified" />
+                            )}
+                            {model.providerHealth === 'UNCONFIGURED' && (
+                              <span className="w-2 h-2 rounded-full bg-gray-400 flex-shrink-0" title="API key not configured" />
+                            )}
+                          </div>
+                        </td>
+                        <td className="py-3 px-3">
+                          {model.pricingTier === 'free' ? (
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
+                              Free Tier
+                            </span>
+                          ) : model.pricingTier === 'paid' ? (
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
+                              Paid API
+                            </span>
+                          ) : (
+                            <span className="text-caption text-eco-text-secondary">Unknown</span>
+                          )}
                         </td>
                         <td className="py-3 px-3">
                           {model.eligible ? (
                             <span className="badge-success text-[11px]">Eligible</span>
+                          ) : model.disqualifyReason === 'PAID_MODEL_EXCLUDED' ? (
+                            <span
+                              className="px-2 py-0.5 rounded text-[11px] font-semibold bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-300 border border-amber-300 dark:border-amber-800 cursor-help"
+                              title="Commercial paid model excluded by Free-Models-Only policy"
+                            >
+                              Excluded (Paid)
+                            </span>
+                          ) : model.status === 'model_not_installed' || model.disqualifyReason === 'MODEL_NOT_INSTALLED' ? (
+                            <span
+                              className="px-2 py-0.5 rounded text-[11px] font-semibold bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-300 border border-amber-300 dark:border-amber-800 cursor-help"
+                              title={model.disqualifyReason || 'Model not installed/pulled in local provider'}
+                            >
+                              Not Installed
+                            </span>
+                          ) : model.status === 'provider_unavailable' || model.disqualifyReason === 'PROVIDER_UNREACHABLE' ? (
+                            <span
+                              className="px-2 py-0.5 rounded text-[11px] font-semibold bg-red-100 text-red-900 dark:bg-red-950/60 dark:text-red-300 border border-red-300 dark:border-red-800 cursor-help"
+                              title={model.disqualifyReason || 'Provider daemon unreachable or connection refused'}
+                            >
+                              Unreachable
+                            </span>
+                          ) : model.disqualifyReason === 'PROVIDER_UNCONFIGURED' ? (
+                            <span
+                              className="px-2 py-0.5 rounded text-[11px] font-medium bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300 border border-gray-300 dark:border-gray-700 cursor-help"
+                              title="Provider API key not configured"
+                            >
+                              No Key Set
+                            </span>
+                          ) : model.status === 'insufficient_data' || model.disqualifyReason === 'INSUFFICIENT_DATA' ? (
+                            <span
+                              className="px-2 py-0.5 rounded text-[11px] font-medium bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-300 cursor-help"
+                              title={model.disqualifyReason || 'Missing required environmental metadata'}
+                            >
+                              Insufficient Data
+                            </span>
                           ) : (
                             <span
                               className="badge-warning text-[11px] cursor-help"
                               title={model.disqualifyReason || 'Ineligible'}
                             >
-                              Ineligible
+                              Excluded
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 text-caption">
+                          {model.modelAvailability === 'AVAILABLE' ? (
+                            <span className="text-emerald-700 dark:text-emerald-400 font-medium">✓ Ready</span>
+                          ) : model.modelAvailability === 'NOT_INSTALLED' ? (
+                            <span className="text-amber-700 dark:text-amber-400">Missing Tag</span>
+                          ) : (
+                            <span className="text-eco-text-secondary">{model.modelAvailability || '—'}</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 text-center font-mono">
+                          {wasActuallyCalled ? (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300 border border-green-300">
+                              YES (1x)
+                            </span>
+                          ) : (
+                            <span className="text-[11px] text-eco-text-secondary dark:text-dark-text-secondary opacity-60">
+                              NO (0x)
                             </span>
                           )}
                         </td>
                         <td className="py-3 px-3 font-mono text-caption">
-                          {model.estimatedTokens ? model.estimatedTokens.toLocaleString() : '—'}
+                          <div>
+                            <span>{model.estimatedTokens ? model.estimatedTokens.toLocaleString() : '—'}</span>
+                            {model.inputTokens != null && model.predictedOutputTokens != null && (
+                              <span className="text-[10px] text-eco-text-secondary dark:text-dark-text-secondary block">
+                                {model.inputTokens}in / {model.predictedOutputTokens}out
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td className="py-3 px-3 font-mono text-caption">
-                          {model.estimatedCost != null ? `$${model.estimatedCost.toFixed(6)}` : '—'}
+                          {model.estimatedCost === 0 ? (
+                            <span className="text-emerald-700 dark:text-emerald-400 font-semibold">$0.00 (Free)</span>
+                          ) : model.estimatedCost != null ? (
+                            `$${model.estimatedCost.toFixed(6)}`
+                          ) : (
+                            '—'
+                          )}
                         </td>
                         <td className="py-3 px-3 font-mono text-caption">
                           {model.estimatedCarbon != null ? `${model.estimatedCarbon.toFixed(4)}g` : '—'}
+                        </td>
+                        <td className="py-3 px-3 font-mono text-caption">
+                          {model.estimatedWater != null ? `${model.estimatedWater.toFixed(4)}L` : <span className="text-eco-text-secondary italic">Unavailable</span>}
                         </td>
                         <td className="py-3 px-3 font-mono text-caption">
                           {model.qualityScore ? `${model.qualityScore}/100` : '—'}
@@ -722,7 +1023,16 @@ export default function DashboardPage() {
                           {model.latencyMs != null ? `${model.latencyMs}ms` : '—'}
                         </td>
                         <td className="py-3 px-4 font-mono font-bold text-right text-brand-600 dark:text-brand-400">
-                          {model.routingScore}%
+                          {model.routingScore != null ? (
+                            `${model.routingScore}%`
+                          ) : (
+                            <span
+                              className="text-eco-text-secondary dark:text-dark-text-secondary text-caption italic font-normal"
+                              title={model.disqualifyReason || 'Not ranked (excluded from candidate set)'}
+                            >
+                              Not Ranked
+                            </span>
+                          )}
                         </td>
                       </tr>
                     );
@@ -737,7 +1047,7 @@ export default function DashboardPage() {
             {/* Chart 1: Routing Score Comparison */}
             <div className="card shadow-sm">
               <h3 className="font-serif text-heading-3 text-eco-text dark:text-dark-text mb-4">
-                Routing Score Comparison
+                Routing Score Comparison (Decision Ranking)
               </h3>
               <ResponsiveContainer width="100%" height={260}>
                 <BarChart data={buildRoutingScoreChartData(result.evaluations)} layout="vertical" margin={{ left: 10, right: 20 }}>
@@ -799,7 +1109,7 @@ export default function DashboardPage() {
             {result.selectedModel && (
               <div className="card shadow-sm">
                 <h3 className="font-serif text-heading-3 text-eco-text dark:text-dark-text mb-4">
-                  Selected Model Efficiency Radar
+                  Selected Model Dimension Radar
                 </h3>
                 <ResponsiveContainer width="100%" height={260}>
                   <RadarChart
@@ -808,6 +1118,7 @@ export default function DashboardPage() {
                       { metric: 'Cost Eff.', value: result.selectedModel.breakdown.cost },
                       { metric: 'Token Eff.', value: result.selectedModel.breakdown.tokenEfficiency },
                       { metric: 'Eco Eff.', value: result.selectedModel.breakdown.environmental },
+                      { metric: 'Latency', value: result.selectedModel.breakdown.latency },
                     ]}
                     cx="50%"
                     cy="50%"
@@ -825,7 +1136,7 @@ export default function DashboardPage() {
 
       {/* Admin Routing Debugger Modal / Section */}
       {showDebugger && (
-        <div className="card mt-8 border-brand-400 dark:border-brand-600 bg-eco-surface dark:bg-dark-surface shadow-xl animate-fade-in">
+        <div className="card border-brand-400 dark:border-brand-600 bg-eco-surface dark:bg-dark-surface shadow-xl animate-fade-in">
           <div className="flex items-center justify-between mb-4 border-b border-eco-border dark:border-dark-border pb-3">
             <div className="flex items-center gap-2">
               <Bug className="w-5 h-5 text-brand-600 dark:text-brand-400" />
@@ -846,6 +1157,55 @@ export default function DashboardPage() {
               </pre>
             </div>
 
+            {/* Candidate Pre-Routing Verification Matrix */}
+            {result?.evaluations && result.evaluations.length > 0 && (
+              <div>
+                <span className="text-eco-text-secondary dark:text-dark-text-secondary block font-bold mb-1">
+                  Candidate Health & Routing Eligibility Matrix (Strict Pre-Routing Validation):
+                </span>
+                <div className="overflow-x-auto border border-eco-border dark:border-dark-border rounded-lg bg-eco-surface-alt dark:bg-dark-bg">
+                  <table className="w-full text-left text-[11px] border-collapse">
+                    <thead>
+                      <tr className="border-b border-eco-border dark:border-dark-border bg-eco-surface dark:bg-dark-surface-alt text-eco-text-secondary font-semibold">
+                        <th className="p-2">Model</th>
+                        <th className="p-2">Provider</th>
+                        <th className="p-2">Provider Health</th>
+                        <th className="p-2">Model Avail.</th>
+                        <th className="p-2">Eligible</th>
+                        <th className="p-2">Disqualify Reason</th>
+                        <th className="p-2 text-right">Score</th>
+                        <th className="p-2 text-center">Called</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-eco-border dark:divide-dark-border">
+                      {result.evaluations.map((c) => (
+                        <tr key={c.modelId} className={c.isSelected ? 'bg-brand-50/50 dark:bg-brand-950/20 font-bold' : ''}>
+                          <td className="p-2">{c.modelName}</td>
+                          <td className="p-2">{c.providerName}</td>
+                          <td className="p-2">
+                            <span className={c.providerHealth === 'HEALTHY' ? 'text-emerald-600 font-bold' : 'text-red-500 font-bold'}>
+                              {c.providerHealth || 'UNKNOWN'}
+                            </span>
+                          </td>
+                          <td className="p-2">
+                            <span className={c.modelAvailability === 'AVAILABLE' ? 'text-emerald-600 font-bold' : 'text-amber-500 font-bold'}>
+                              {c.modelAvailability || 'UNKNOWN'}
+                            </span>
+                          </td>
+                          <td className="p-2">{c.eligible ? 'YES' : 'NO'}</td>
+                          <td className="p-2 text-eco-text-secondary max-w-xs truncate" title={c.disqualifyReason}>
+                            {c.disqualifyReason || '—'}
+                          </td>
+                          <td className="p-2 text-right">{c.routingScore != null ? `${c.routingScore}%` : 'Not Ranked'}</td>
+                          <td className="p-2 text-center">{c.wasCalled || c.isSelected ? 'YES (1x)' : 'NO (0x)'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
             <div className="grid sm:grid-cols-2 gap-4">
               <div>
                 <span className="text-eco-text-secondary dark:text-dark-text-secondary block font-bold mb-1">
@@ -857,12 +1217,33 @@ export default function DashboardPage() {
               </div>
               <div>
                 <span className="text-eco-text-secondary dark:text-dark-text-secondary block font-bold mb-1">
-                  Selected Model & Actual Usage:
+                  Baseline Estimate (Counterfactual):
+                </span>
+                <pre className="p-3 bg-eco-surface-alt dark:bg-dark-bg rounded border border-eco-border dark:border-dark-border overflow-x-auto">
+                  {JSON.stringify(result?.baseline || {}, null, 2)}
+                </pre>
+              </div>
+            </div>
+
+            <div className="grid sm:grid-cols-2 gap-4">
+              <div>
+                <span className="text-eco-text-secondary dark:text-dark-text-secondary block font-bold mb-1">
+                  Sustainability Balance Sheet & Break-Even:
+                </span>
+                <pre className="p-3 bg-eco-surface-alt dark:bg-dark-bg rounded border border-eco-border dark:border-dark-border overflow-x-auto">
+                  {JSON.stringify(result?.sustainability || {}, null, 2)}
+                </pre>
+              </div>
+              <div>
+                <span className="text-eco-text-secondary dark:text-dark-text-secondary block font-bold mb-1">
+                  Selected Model & Actual Execution Usage:
                 </span>
                 <pre className="p-3 bg-eco-surface-alt dark:bg-dark-bg rounded border border-eco-border dark:border-dark-border overflow-x-auto">
                   {JSON.stringify(
                     {
                       selectedModel: result?.selectedModel,
+                      routingPerformed: result?.routingPerformed,
+                      bypassReason: result?.bypassReason,
                       actualUsage: result?.actualUsage,
                     },
                     null,
@@ -879,46 +1260,131 @@ export default function DashboardPage() {
 }
 
 // ============================================================================
-// Chart Data Builders (Dynamic, Non-Hardcoded, Handling Missing Values)
+// Net Outcome Component (Zero-Greenwashing & Break-Even Evaluation)
 // ============================================================================
 
-function isFiniteNumber(val: any): val is number {
-  return typeof val === 'number' && Number.isFinite(val);
+function NetOutcomeCard({
+  outcomeStatus,
+  outcomeMessage,
+  routingPerformed,
+  bypassReason,
+  netCarbonGrams,
+  netCarbonPct,
+  netCostUsd,
+  netCostPct,
+}: {
+  outcomeStatus?: string;
+  outcomeMessage?: string;
+  routingPerformed: boolean;
+  bypassReason?: string;
+  netCarbonGrams?: number | null;
+  netCarbonPct?: number | null;
+  netCostUsd?: number | null;
+  netCostPct?: number | null;
+}) {
+  if (!routingPerformed) {
+    return (
+      <div className="card border-blue-300 dark:border-blue-800 bg-blue-50/70 dark:bg-blue-900/20 shadow-xs">
+        <div className="flex items-start gap-3">
+          <Info className="w-5 h-5 text-blue-600 dark:text-blue-400 mt-0.5 flex-shrink-0" />
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="px-2 py-0.5 rounded text-caption font-bold bg-blue-200 text-blue-800 dark:bg-blue-800 dark:text-blue-100">
+                Direct Baseline Bypass
+              </span>
+            </div>
+            <h4 className="font-serif text-heading-4 text-blue-900 dark:text-blue-200 mb-1">
+              Routing Overhead Exceeded Anticipated Savings
+            </h4>
+            <p className="text-body-sm text-blue-800 dark:text-blue-300">
+              {bypassReason || 'Routing was safely bypassed to avoid unnecessary computational overhead on this task.'} The query was sent directly to the baseline model without multi-candidate scoring overhead.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (outcomeStatus === 'overhead_exceeded') {
+    return (
+      <div className="card border-amber-300 dark:border-amber-800 bg-amber-50/70 dark:bg-amber-900/20 shadow-xs">
+        <div className="flex items-start gap-3">
+          <AlertTriangle className="w-5 h-5 text-amber-600 dark:text-amber-400 mt-0.5 flex-shrink-0" />
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="px-2 py-0.5 rounded text-caption font-bold bg-amber-200 text-amber-800 dark:bg-amber-800 dark:text-amber-100">
+                Overhead Exceeded Savings
+              </span>
+              {netCarbonGrams != null && (
+                <span className="text-caption font-mono text-amber-700 dark:text-amber-300">
+                  Net Carbon: +{Math.abs(netCarbonGrams).toFixed(4)}g CO₂e
+                </span>
+              )}
+            </div>
+            <h4 className="font-serif text-heading-4 text-amber-900 dark:text-amber-200 mb-1">
+              Routing Overhead Outweighed Model Efficiency Gains
+            </h4>
+            <p className="text-body-sm text-amber-800 dark:text-amber-300">
+              {outcomeMessage || 'Routing computational overhead exceeded estimated model efficiency gains.'} In accordance with our anti-greenwashing guidelines, negative environmental savings are preserved and reported accurately rather than hidden.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (outcomeStatus === 'net_saving') {
+    return (
+      <div className="card border-emerald-300 dark:border-emerald-800 bg-emerald-50/70 dark:bg-emerald-900/20 shadow-xs">
+        <div className="flex items-start gap-3">
+          <CheckCircle2 className="w-5 h-5 text-emerald-600 dark:text-emerald-400 mt-0.5 flex-shrink-0" />
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="px-2 py-0.5 rounded text-caption font-bold bg-emerald-200 text-emerald-800 dark:bg-emerald-800 dark:text-emerald-100">
+                Verified Net Savings
+              </span>
+              <span className="text-caption font-mono text-emerald-700 dark:text-emerald-300">
+                Cost: {netCostPct != null ? `-${Math.abs(netCostPct).toFixed(1)}%` : '—'}{netCostUsd != null ? ` ($${Math.abs(netCostUsd).toFixed(6)})` : ''} · Carbon: {netCarbonPct != null ? `-${Math.abs(netCarbonPct).toFixed(1)}%` : '—'}
+              </span>
+            </div>
+            <h4 className="font-serif text-heading-4 text-emerald-900 dark:text-emerald-200 mb-1">
+              Defensible Net Environmental & Economic Benefit
+            </h4>
+            <p className="text-body-sm text-emerald-800 dark:text-emerald-300">
+              {outcomeMessage || 'Net savings achieved across cost and carbon dimensions.'} Net savings account for the wall-clock latency, host CPU energy, and grid carbon required to execute EcoRoute's multi-candidate selection.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (outcomeStatus === 'no_measurable_saving' || outcomeStatus === 'unreliable_estimate') {
+    return (
+      <div className="card border-slate-300 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-900/20 shadow-xs">
+        <div className="flex items-start gap-3">
+          <Info className="w-5 h-5 text-slate-600 dark:text-slate-400 mt-0.5 flex-shrink-0" />
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="px-2 py-0.5 rounded text-caption font-bold bg-slate-200 text-slate-800 dark:bg-slate-800 dark:text-slate-200">
+                {outcomeStatus === 'unreliable_estimate' ? 'Unreliable Estimate' : 'No Measurable Net Saving'}
+              </span>
+            </div>
+            <h4 className="font-serif text-heading-4 text-slate-800 dark:text-slate-200 mb-1">
+              Estimated Parity with Direct Baseline
+            </h4>
+            <p className="text-body-sm text-slate-700 dark:text-slate-300">
+              {outcomeMessage || 'Routing performed with negligible variance in environmental impact relative to the direct baseline.'}
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
 }
 
-export function buildRoutingScoreChartData(evaluations: EvaluatedModel[]) {
-  return evaluations
-    .filter((e) => e.eligible)
-    .map((e) => ({
-      name: e.modelName.replace(' ', '\n'),
-      score: e.routingScore,
-      isSelected: e.isSelected,
-    }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 8);
-}
-
-export function buildCostChartData(evaluations: EvaluatedModel[]) {
-  return evaluations
-    .filter((e) => e.eligible && isFiniteNumber(e.estimatedCost))
-    .map((e) => ({
-      name: e.modelName.replace(' ', '\n'),
-      cost: isFiniteNumber(e.estimatedCost) ? Number(e.estimatedCost.toFixed(6)) : null,
-    }))
-    .sort((a, b) => (a.cost ?? 0) - (b.cost ?? 0))
-    .slice(0, 8);
-}
-
-export function buildCarbonChartData(evaluations: EvaluatedModel[]) {
-  return evaluations
-    .filter((e) => e.eligible && isFiniteNumber(e.estimatedCarbon))
-    .map((e) => ({
-      name: e.modelName.replace(' ', '\n'),
-      carbon: isFiniteNumber(e.estimatedCarbon) ? Number(e.estimatedCarbon.toFixed(4)) : null,
-    }))
-    .sort((a, b) => (a.carbon ?? 0) - (b.carbon ?? 0))
-    .slice(0, 8);
-}
 
 // ============================================================================
 // Metric Card Component

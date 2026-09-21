@@ -16,7 +16,12 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "exactOptionalPropertyTypes": false,
-    "noUncheckedIndexedAccess": true
+    "noUncheckedIndexedAccess": true,
+    "baseUrl": ".",
+    "paths": {
+      "@ecoroute/config": ["packages/config/src/index.ts"],
+      "@ecoroute/shared-types": ["packages/shared-types/src/index.ts"],
+      "@ecoroute/validation": ["packages/validation/src/index.ts"]
+    }
   }
 }

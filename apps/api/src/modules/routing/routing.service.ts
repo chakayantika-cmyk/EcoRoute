@@ -1,10 +1,8 @@
 // ============================================================================
 // Routing Engine — Core Service (Scientific Dynamic Multi-Model Router)
-// Based on:
-// - "Sprout: Green Generative AI with Carbon-Efficient LLM Inference" (EMNLP 2024)
-// - "Trends in AI inference energy consumption: Beyond the performance-vs-parameter laws of deep learning" (2023)
-// Stage 1: Inexpensive local parallel evaluation of all models
-// Stage 2: Execution of the single winning model
+// Stage 1: Inexpensive local parallel evaluation of all models + Counterfactual Baseline
+// Stage 2: Execution of the single winning model (or baseline if break-even bypassed)
+// Strict Production Rule: Never fabricate answers, never silently fall back to fake answers.
 // ============================================================================
 
 import { PrismaClient } from '@prisma/client';
@@ -14,49 +12,52 @@ import {
   ENVIRONMENTAL_METHODOLOGY,
   ModelEnergyProfile,
 } from '@ecoroute/config';
-import { NotFoundError, ProviderError } from '../../lib/errors';
+import { NotFoundError, AllProvidersFailedError, NoEligibleFreeModelError } from '../../lib/errors';
 import { executeModelCall, streamModelCall } from '../../lib/ai-providers';
-import { calculateTokenCount } from '../../lib/dynamic-synthesizer';
 import { ModelRegistryCache, CandidateModelRecord } from '../models/model-registry.service';
-
-export interface TaskAnalysisProfile {
-  domain: string;
-  domainLabel: string;
-  complexityIndex: number; // 0.05 to 0.98
-  complexityTier: 'Low' | 'Moderate' | 'High' | 'Very High';
-  reasoningDepth: number; // 0.0 to 1.0
-  constraintDensity: number; // 0.0 to 1.0
-  lexicalDiversity: number; // Type-Token Ratio 0.0 to 1.0
-  wordCount: number;
-  inputTokens: number;
-  predictedOutputTokens: number;
-  expansionRatio: number;
-  totalEstimatedTokens: number;
-  detectedFeatures: string[];
-}
+import { ProviderHealthService } from '../providers/provider-health.service';
+import { TaskAnalysisService } from './task-analysis.service';
+import { TaskAnalysisProfile } from './task-analysis.types';
+import { BaselineService, BaselineEstimate } from './baseline.service';
+import { RoutingOverheadService } from './routing-overhead.service';
+import { BreakEvenService } from './break-even.service';
+import { SustainabilityAccountingService, SelectedModelMetrics } from './sustainability-accounting.service';
 
 export interface CandidateModel extends CandidateModelRecord {}
 
 export interface ScoredCandidate {
   model: CandidateModel;
   scores: {
-    tokenEfficiency: number;
-    cost: number;
     quality: number;
+    cost: number;
+    tokenEfficiency: number;
     environmental: number;
+    latency: number;
   };
-  totalScore: number;
+  totalScore: number | null;
   estimatedTokens: number;
   estimatedCost: number | null;
   estimatedEnergyWh: number | null;
+  estimatedWaterLiters: number | null;
   estimatedCarbonGrams: number | null;
-  estimatedLatencyMs?: number | null;
+  estimatedLatencyMs: number | null;
   prefillEnergyWh?: number | null;
   decodeEnergyWh?: number | null;
   qualityScore: number;
   qualitySource: string;
   eligible: boolean;
+  status: 'evaluated' | 'eligible' | 'excluded' | 'insufficient_data' | 'provider_unavailable' | 'model_not_installed';
   disqualifyReason?: string;
+  providerHealth?: 'HEALTHY' | 'UNREACHABLE' | 'UNCONFIGURED' | 'DEGRADED';
+  modelAvailability?: 'AVAILABLE' | 'NOT_INSTALLED' | 'UNKNOWN' | 'INSUFFICIENT_DATA';
+  wasCalled?: boolean;
+  provenance: {
+    qualitySource: string;
+    qualityBenchmark: string;
+    latencySource: string;
+    energySource: string;
+    pricingSource: string;
+  };
 }
 
 export class RoutingService {
@@ -66,6 +67,7 @@ export class RoutingService {
    * Complete non-streaming route execution
    */
   async routeTask(taskId: string, userId: string, strategy?: string, abortSignal?: AbortSignal) {
+    const stopTimer = RoutingOverheadService.startTimer();
     const task = await this.prisma.task.findUnique({ where: { id: taskId } });
     if (!task) throw new NotFoundError('Task', taskId);
 
@@ -76,16 +78,26 @@ export class RoutingService {
         where: { userId },
       });
 
-      const strategyKey = (strategy ?? preferences?.defaultStrategy ?? 'balanced') as keyof typeof ROUTING_STRATEGY_WEIGHTS;
-      const baseWeights = ROUTING_STRATEGY_WEIGHTS[strategyKey] ?? ROUTING_STRATEGY_WEIGHTS.balanced;
+      const strategyKey = (strategy ?? preferences?.defaultStrategy ?? 'balanced');
+      const baseWeights: { quality: number; cost: number; tokenEfficiency: number; environmental: number; latency: number } =
+        (ROUTING_STRATEGY_WEIGHTS as any)[strategyKey] ?? ROUTING_STRATEGY_WEIGHTS.balanced;
 
       console.log(`[EcoRoute] Task received: ${taskId}`);
-      const taskProfile = this.analyzeTask(task.inputText);
+      const taskProfile = TaskAnalysisService.analyze(task.inputText);
       console.log(`[EcoRoute] Task type: ${taskProfile.domain} (TCI: ${taskProfile.complexityIndex})`);
 
       const candidates = await ModelRegistryCache.getActiveModels(this.prisma);
       console.log(`[EcoRoute] Loaded ${candidates.length} candidates from catalog`);
 
+      // 1. Counterfactual Baseline Estimate (No double AI call)
+      const baselineModel = BaselineService.resolveBaselineModel(candidates, preferences?.baselineModelId);
+      const baselineEstimate = BaselineService.estimateBaseline(baselineModel, taskProfile);
+      console.log(`[EcoRoute] Baseline model: ${baselineEstimate.displayName} (${baselineEstimate.providerName})`);
+
+      // 2. Phase 1: Cheap Pre-Screen
+      const preScreen = BreakEvenService.preScreen(taskProfile, baselineEstimate);
+
+      // 3. Parallel Candidate Model Evaluation
       const scoredCandidates = await this.evaluateCandidatesParallel(
         candidates,
         taskProfile,
@@ -93,26 +105,71 @@ export class RoutingService {
         strategyKey,
       );
 
-      const eligible = scoredCandidates.filter((c) => c.eligible);
-      console.log(`[EcoRoute] Eligible models: ${eligible.length}`);
+      const eligible = scoredCandidates.filter((c) => c.eligible && c.totalScore != null);
+      console.log(`[EcoRoute] Eligible models: ${eligible.length} / ${candidates.length}`);
 
       if (eligible.length === 0) {
+        const providerSummaries = this.buildProviderSummaries(scoredCandidates);
+        const diagnostics = scoredCandidates
+          .map((c) => `• ${c.model.displayName} (${c.model.providerName}): ${c.disqualifyReason || 'Ineligible'}`)
+          .join('\n');
+        const summaryText = providerSummaries.map((p) => `• ${p.providerName}: ${p.statusSummary}`).join('\n');
+        const errMsg = `No eligible AI models are currently available to execute this task.\n\nProvider Status:\n${summaryText}`;
+
         await this.prisma.task.update({
           where: { id: taskId },
-          data: { status: 'FAILED', errorInfo: 'No eligible models found', completedAt: new Date() },
+          data: { status: 'FAILED', errorInfo: errMsg, completedAt: new Date() },
         });
-        throw new ProviderError('routing', 'No eligible models available for this task');
+        if (process.env.FREE_MODELS_ONLY !== 'false') {
+          throw new NoEligibleFreeModelError(errMsg, { candidateCount: candidates.length, diagnostics, providerSummaries });
+        }
+        throw new AllProvidersFailedError(errMsg, { candidateCount: candidates.length, diagnostics, providerSummaries });
       }
 
-      const selected = eligible.sort((a, b) => b.totalScore - a.totalScore)[0]!;
-      console.log(`[EcoRoute] Selected: ${selected.model.displayName} (${selected.model.providerName}) with score ${(selected.totalScore * 100).toFixed(1)}`);
+      const bestCandidate = eligible.sort((a, b) => (b.totalScore ?? 0) - (a.totalScore ?? 0))[0]!;
+      bestCandidate.wasCalled = true;
 
-      await this.prisma.task.update({ where: { id: taskId }, data: { status: 'PROCESSING' } });
+      // 4. Measure Router Overhead so far
+      const elapsedRouterMs = stopTimer();
+      const overhead = RoutingOverheadService.calculateOverhead(elapsedRouterMs);
+      console.log(`[EcoRoute] Routing latency: ${overhead.routerLatencyMs}ms, overhead energy: ${overhead.routerEnergyWh}Wh`);
 
-      // Stage 2: Execution with ONLY the selected model
-      console.log(`[EcoRoute] Generating response with ${selected.model.displayName}...`);
+      // 5. Phase 2: Final Break-Even check
+      let selectedCandidate = bestCandidate;
+      let routingPerformed = true;
+      let bypassReason: string | null = null;
+
+      if (!preScreen.shouldProceed) {
+        routingPerformed = false;
+        bypassReason = preScreen.bypassReason || 'Routing overhead exceeds expected benefit.';
+      } else {
+        const breakEven = BreakEvenService.evaluateFinalBreakEven(
+          baselineEstimate,
+          bestCandidate.estimatedCost,
+          bestCandidate.estimatedEnergyWh,
+          overhead,
+        );
+
+        if (!breakEven.shouldRoute) {
+          routingPerformed = false;
+          bypassReason = breakEven.bypassReason || 'Routing overhead exceeds expected benefit.';
+          console.log(`[EcoRoute] Break-even bypass triggered: ${bypassReason}`);
+        }
+      }
+
+      // If bypassed, direct execution goes to Baseline Model ONLY if Baseline Model is eligible; otherwise to Best Candidate
+      const canExecuteBaseline = eligible.some((e) => e.model.id === baselineModel.id);
+      const modelToExecute = (routingPerformed || !canExecuteBaseline) ? selectedCandidate.model : baselineModel;
+      if (!routingPerformed && !canExecuteBaseline) {
+        console.log(`[EcoRoute] Break-even bypass triggered, but baseline model (${baselineModel.displayName}) is not eligible to execute. Executing best eligible candidate (${selectedCandidate.model.displayName}) instead.`);
+      }
+      console.log(`[EcoRoute] Selected model for execution: ${modelToExecute.displayName} (${modelToExecute.providerName})`);
+
+      await this.prisma.task.update({ where: { id: taskId }, data: { status: 'GENERATING' } });
+
+      // Stage 2: Execution with ONLY the single chosen model
       const providerRecord = await this.prisma.aIProvider.findUnique({
-        where: { id: selected.model.providerId },
+        where: { id: modelToExecute.providerId },
       });
       let providerApiKey: string | undefined;
       if (providerRecord?.configJson) {
@@ -125,51 +182,113 @@ export class RoutingService {
       const execResult = await executeModelCall(
         task.inputText,
         {
-          modelKey: selected.model.modelKey,
-          displayName: selected.model.displayName,
-          providerKey: selected.model.providerKey,
-          providerName: selected.model.providerName,
-          providerModelId: selected.model.providerModelId,
-          adapterType: selected.model.adapterType,
-          baseUrl: selected.model.baseUrl,
-          capabilities: selected.model.capabilities,
-          contextWindow: selected.model.contextWindow,
-          pricing: selected.model.pricing,
+          modelKey: modelToExecute.modelKey,
+          displayName: modelToExecute.displayName,
+          providerKey: modelToExecute.providerKey,
+          providerName: modelToExecute.providerName,
+          providerModelId: modelToExecute.providerModelId,
+          adapterType: modelToExecute.adapterType,
+          baseUrl: modelToExecute.baseUrl,
+          capabilities: modelToExecute.capabilities,
+          contextWindow: modelToExecute.contextWindow,
+          pricing: modelToExecute.pricing,
         },
         providerApiKey,
         abortSignal,
       );
 
-      console.log(`[EcoRoute] Generation completed in ${execResult.latencyMs}ms (${execResult.actualTokens} tokens)`);
+      console.log(`[EcoRoute] Provider generation completed in ${execResult.latencyMs}ms (${execResult.actualTokens} tokens)`);
+
+      // 6. Sustainability Accounting
+      const selectedMetrics: SelectedModelMetrics = {
+        modelId: modelToExecute.id,
+        costUsd: execResult.actualCost ?? (routingPerformed ? selectedCandidate.estimatedCost : baselineEstimate.costUsd),
+        energyWh: routingPerformed ? selectedCandidate.estimatedEnergyWh : baselineEstimate.energyWh,
+        waterLiters: routingPerformed ? selectedCandidate.estimatedWaterLiters : baselineEstimate.waterLiters,
+        carbonGramsCo2e: routingPerformed ? selectedCandidate.estimatedCarbonGrams : baselineEstimate.carbonGramsCo2e,
+        latencyMs: execResult.latencyMs,
+      };
+
+      const sustainability = SustainabilityAccountingService.computeAccounting(
+        baselineEstimate,
+        overhead,
+        selectedMetrics,
+        routingPerformed,
+        bypassReason,
+      );
 
       const explanation = this.buildScientificExplanation(
-        selected,
+        selectedCandidate,
         strategyKey,
         taskProfile,
         scoredCandidates.length,
         execResult.isLive,
+        routingPerformed,
+        bypassReason,
       );
 
-      const evaluationsJson = this.buildEvaluationsPayload(scoredCandidates, taskProfile, selected);
+      const evaluationsJson = this.buildEvaluationsPayload(scoredCandidates, taskProfile, selectedCandidate, baselineEstimate);
 
+      // Persist to database
       const routingResult = await this.prisma.routingResult.create({
         data: {
           taskId,
-          selectedModelId: selected.model.id,
+          selectedModelId: modelToExecute.id,
           strategy: strategyKey,
           estimatedTokens: taskProfile.totalEstimatedTokens,
           actualTokens: execResult.actualTokens,
-          estimatedCostValue: selected.estimatedCost,
+          estimatedCostValue: selectedCandidate.estimatedCost,
           estimatedCostCurrency: 'USD',
           actualCostValue: execResult.actualCost,
-          energyWh: selected.estimatedEnergyWh,
-          carbonGrams: selected.estimatedCarbonGrams,
+          energyWh: selectedCandidate.estimatedEnergyWh,
+          waterLiters: selectedCandidate.estimatedWaterLiters,
+          carbonGrams: selectedCandidate.estimatedCarbonGrams,
           environmentalStatus: 'ESTIMATED',
           methodologyVersion: ENVIRONMENTAL_METHODOLOGY.version,
-          qualityScore: selected.qualityScore,
+          qualityScore: selectedCandidate.qualityScore,
           qualityScoreType: execResult.isLive ? 'ACTUAL' : 'SIMULATED',
           explanation,
           candidateScoresJson: JSON.stringify(evaluationsJson),
+
+          // Baseline accounting
+          baselineModelId: baselineEstimate.modelId,
+          baselineCostValue: baselineEstimate.costUsd,
+          baselineEnergyWh: baselineEstimate.energyWh,
+          baselineWaterLiters: baselineEstimate.waterLiters,
+          baselineCarbonGrams: baselineEstimate.carbonGramsCo2e,
+          baselineLatencyMs: baselineEstimate.latencyMs,
+
+          // Router overhead
+          routerLatencyMs: overhead.routerLatencyMs,
+          routerCostValue: overhead.routerCostUsd,
+          routerEnergyWh: overhead.routerEnergyWh,
+          routerWaterLiters: overhead.routerWaterLiters,
+          routerCarbonGrams: overhead.routerCarbonGramsCo2e,
+
+          // EcoRoute totals
+          ecoRouteTotalCostValue: sustainability.ecoRouteTotal.costUsd,
+          ecoRouteTotalEnergyWh: sustainability.ecoRouteTotal.energyWh,
+          ecoRouteTotalWaterLiters: sustainability.ecoRouteTotal.waterLiters,
+          ecoRouteTotalCarbonGrams: sustainability.ecoRouteTotal.carbonGramsCo2e,
+          ecoRouteTotalLatencyMs: sustainability.ecoRouteTotal.latencyMs,
+
+          // Net savings
+          netCostSavings: sustainability.netSavings.costUsd,
+          netEnergySavings: sustainability.netSavings.energyWh,
+          netWaterSavings: sustainability.netSavings.waterLiters,
+          netCarbonSavings: sustainability.netSavings.carbonGramsCo2e,
+          netSavingsPercentage: sustainability.netSavings.energyPercent,
+
+          // Bypass info
+          routingPerformed,
+          bypassReason,
+
+          sustainabilityJson: JSON.stringify(sustainability),
+          snapshotsJson: JSON.stringify({
+            baseline: baselineEstimate,
+            selected: selectedCandidate,
+            overhead,
+          }),
         },
       });
 
@@ -181,7 +300,7 @@ export class RoutingService {
         },
       });
 
-      await this.saveMetricSnapshots(routingResult.id, selected, taskProfile.totalEstimatedTokens);
+      await this.saveMetricSnapshots(routingResult.id, selectedCandidate, taskProfile.totalEstimatedTokens);
 
       await this.prisma.task.update({
         where: { id: taskId },
@@ -191,8 +310,10 @@ export class RoutingService {
       return {
         task,
         routingResult,
-        selectedModel: selected,
+        selectedModel: selectedCandidate,
         evaluations: evaluationsJson.evaluations,
+        baseline: baselineEstimate,
+        sustainability,
         answer: execResult,
       };
     } catch (err: any) {
@@ -218,6 +339,7 @@ export class RoutingService {
     onEvent: (event: { event: string; data: any }) => void,
     abortSignal?: AbortSignal,
   ) {
+    const stopTimer = RoutingOverheadService.startTimer();
     const task = await this.prisma.task.findUnique({ where: { id: taskId } });
     if (!task) throw new NotFoundError('Task', taskId);
 
@@ -227,10 +349,11 @@ export class RoutingService {
     const preferences = await this.prisma.routingPreference.findUnique({
       where: { userId },
     });
-    const strategyKey = (strategy ?? preferences?.defaultStrategy ?? 'balanced') as keyof typeof ROUTING_STRATEGY_WEIGHTS;
-    const baseWeights = ROUTING_STRATEGY_WEIGHTS[strategyKey] ?? ROUTING_STRATEGY_WEIGHTS.balanced;
+    const strategyKey = (strategy ?? preferences?.defaultStrategy ?? 'balanced');
+    const baseWeights: { quality: number; cost: number; tokenEfficiency: number; environmental: number; latency: number } =
+      (ROUTING_STRATEGY_WEIGHTS as any)[strategyKey] ?? ROUTING_STRATEGY_WEIGHTS.balanced;
 
-    const taskProfile = this.analyzeTask(task.inputText);
+    const taskProfile = TaskAnalysisService.analyze(task.inputText);
     onEvent({ event: 'taskAnalysis', data: taskProfile });
 
     // Event 2: Evaluating
@@ -240,6 +363,9 @@ export class RoutingService {
       data: { status: 'evaluating', message: `Evaluating ${candidates.length} candidate models...` },
     });
 
+    const baselineModel = BaselineService.resolveBaselineModel(candidates, preferences?.baselineModelId);
+    const baselineEstimate = BaselineService.estimateBaseline(baselineModel, taskProfile);
+
     const scoredCandidates = await this.evaluateCandidatesParallel(
       candidates,
       taskProfile,
@@ -247,41 +373,114 @@ export class RoutingService {
       strategyKey,
     );
 
-    const eligible = scoredCandidates.filter((c) => c.eligible);
+    const eligible = scoredCandidates.filter((c) => c.eligible && c.totalScore != null);
     if (eligible.length === 0) {
-      throw new ProviderError('routing', 'No eligible models available for this task');
+      const providerSummaries = this.buildProviderSummaries(scoredCandidates);
+      const diagnostics = scoredCandidates
+        .map((c) => `• ${c.model.displayName} (${c.model.providerName}): ${c.disqualifyReason || 'Ineligible'}`)
+        .join('\n');
+      const summaryText = providerSummaries.map((p) => `• ${p.providerName}: ${p.statusSummary}`).join('\n');
+      const hasAnyConfigured = scoredCandidates.some((c) => c.providerHealth !== 'UNCONFIGURED');
+      const errCode = process.env.FREE_MODELS_ONLY !== 'false' ? 'NO_ELIGIBLE_FREE_MODEL' : (hasAnyConfigured ? 'ALL_PROVIDERS_FAILED' : 'NO_AI_PROVIDER_CONFIGURED');
+      const errMsg = `No eligible AI models are currently available to execute this task.\n\nProvider Status:\n${summaryText}`;
+
+      const evaluationsJson = this.buildEvaluationsPayload(scoredCandidates, taskProfile, null, baselineEstimate);
+      onEvent({ event: 'evaluations', data: evaluationsJson.evaluations });
+      onEvent({ event: 'baseline', data: baselineEstimate });
+
+      onEvent({
+        event: 'error',
+        data: {
+          code: errCode,
+          message: errMsg,
+          providerSummaries,
+          details: { diagnostics, providerSummaries },
+        },
+      });
+
+      await this.prisma.task.update({
+        where: { id: taskId },
+        data: { status: 'FAILED', errorInfo: errMsg, completedAt: new Date() },
+      });
+
+      if (process.env.FREE_MODELS_ONLY !== 'false') {
+        throw new NoEligibleFreeModelError(errMsg, { candidateCount: candidates.length, diagnostics, providerSummaries });
+      }
+      throw new AllProvidersFailedError(errMsg, { candidateCount: candidates.length, diagnostics, providerSummaries });
     }
 
-    const selected = eligible.sort((a, b) => b.totalScore - a.totalScore)[0]!;
-    const evaluationsJson = this.buildEvaluationsPayload(scoredCandidates, taskProfile, selected);
+    const bestCandidate = eligible.sort((a, b) => (b.totalScore ?? 0) - (a.totalScore ?? 0))[0]!;
+    bestCandidate.wasCalled = true;
+    const evaluationsJson = this.buildEvaluationsPayload(scoredCandidates, taskProfile, bestCandidate, baselineEstimate);
 
     onEvent({ event: 'evaluations', data: evaluationsJson.evaluations });
+    onEvent({ event: 'baseline', data: baselineEstimate });
 
-    // Event 3: Routing decision & Selected Model Recommendation
+    // Event 3: Routing decision & Break-Even check
+    const elapsedRouterMs = stopTimer();
+    const overhead = RoutingOverheadService.calculateOverhead(elapsedRouterMs);
+
+    const preScreen = BreakEvenService.preScreen(taskProfile, baselineEstimate);
+    let selectedCandidate = bestCandidate;
+    let routingPerformed = true;
+    let bypassReason: string | null = null;
+
+    if (!preScreen.shouldProceed) {
+      routingPerformed = false;
+      bypassReason = preScreen.bypassReason || 'Routing overhead exceeds expected benefit.';
+    } else {
+      const breakEven = BreakEvenService.evaluateFinalBreakEven(
+        baselineEstimate,
+        bestCandidate.estimatedCost,
+        bestCandidate.estimatedEnergyWh,
+        overhead,
+      );
+      if (!breakEven.shouldRoute) {
+        routingPerformed = false;
+        bypassReason = breakEven.bypassReason || 'Routing overhead exceeds expected benefit.';
+      }
+    }
+
+    const canExecuteBaseline = eligible.some((e) => e.model.id === baselineModel.id);
+    const modelToExecute = (routingPerformed || !canExecuteBaseline) ? selectedCandidate.model : baselineModel;
+    if (!routingPerformed && !canExecuteBaseline) {
+      console.log(`[EcoRoute] Break-even bypass triggered in stream, but baseline model (${baselineModel.displayName}) is not eligible to execute. Executing best eligible candidate (${selectedCandidate.model.displayName}) instead.`);
+    }
+
     onEvent({
       event: 'state',
-      data: { status: 'routing', message: `Selected ${selected.model.displayName} (${selected.model.providerName})` },
+      data: {
+        status: 'routing',
+        message: routingPerformed
+          ? `Selected ${modelToExecute.displayName} (${modelToExecute.providerName})`
+          : `Direct execution via Baseline (${modelToExecute.displayName}): ${bypassReason}`,
+      },
     });
 
     onEvent({
       event: 'selectedModel',
       data: {
-        modelId: selected.model.id,
-        modelKey: selected.model.modelKey,
-        displayName: selected.model.displayName,
-        provider: selected.model.providerName,
-        routingScore: Number((selected.totalScore * 100).toFixed(1)),
+        modelId: modelToExecute.id,
+        modelKey: modelToExecute.modelKey,
+        displayName: modelToExecute.displayName,
+        provider: modelToExecute.providerName,
+        routingScore: selectedCandidate.totalScore != null ? Number((selectedCandidate.totalScore * 100).toFixed(1)) : null,
         breakdown: {
-          quality: Number((selected.scores.quality * 100).toFixed(1)),
-          cost: Number((selected.scores.cost * 100).toFixed(1)),
-          tokenEfficiency: Number((selected.scores.tokenEfficiency * 100).toFixed(1)),
-          environmental: Number((selected.scores.environmental * 100).toFixed(1)),
+          quality: Number((selectedCandidate.scores.quality * 100).toFixed(1)),
+          cost: Number((selectedCandidate.scores.cost * 100).toFixed(1)),
+          tokenEfficiency: Number((selectedCandidate.scores.tokenEfficiency * 100).toFixed(1)),
+          environmental: Number((selectedCandidate.scores.environmental * 100).toFixed(1)),
+          latency: Number((selectedCandidate.scores.latency * 100).toFixed(1)),
         },
-        estimatedCost: selected.estimatedCost,
-        estimatedCarbon: selected.estimatedCarbonGrams,
-        estimatedTokens: selected.estimatedTokens,
-        qualityScore: selected.qualityScore,
-        estimatedLatencyMs: selected.estimatedLatencyMs,
+        estimatedCost: selectedCandidate.estimatedCost,
+        estimatedEnergy: selectedCandidate.estimatedEnergyWh,
+        estimatedWater: selectedCandidate.estimatedWaterLiters,
+        estimatedCarbon: selectedCandidate.estimatedCarbonGrams,
+        estimatedTokens: selectedCandidate.estimatedTokens,
+        qualityScore: selectedCandidate.qualityScore,
+        estimatedLatencyMs: selectedCandidate.estimatedLatencyMs,
+        routingPerformed,
+        bypassReason,
       },
     });
 
@@ -290,14 +489,14 @@ export class RoutingService {
       event: 'state',
       data: {
         status: 'generating',
-        message: `Generating response with ${selected.model.displayName}...`,
-        selectedModel: selected.model.displayName,
-        provider: selected.model.providerName,
+        message: `Generating response with ${modelToExecute.displayName}...`,
+        selectedModel: modelToExecute.displayName,
+        provider: modelToExecute.providerName,
       },
     });
 
     const providerRecord = await this.prisma.aIProvider.findUnique({
-      where: { id: selected.model.providerId },
+      where: { id: modelToExecute.providerId },
     });
     let providerApiKey: string | undefined;
     if (providerRecord?.configJson) {
@@ -311,16 +510,16 @@ export class RoutingService {
     const execResult = await streamModelCall(
       task.inputText,
       {
-        modelKey: selected.model.modelKey,
-        displayName: selected.model.displayName,
-        providerKey: selected.model.providerKey,
-        providerName: selected.model.providerName,
-        providerModelId: selected.model.providerModelId,
-        adapterType: selected.model.adapterType,
-        baseUrl: selected.model.baseUrl,
-        capabilities: selected.model.capabilities,
-        contextWindow: selected.model.contextWindow,
-        pricing: selected.model.pricing,
+        modelKey: modelToExecute.modelKey,
+        displayName: modelToExecute.displayName,
+        providerKey: modelToExecute.providerKey,
+        providerName: modelToExecute.providerName,
+        providerModelId: modelToExecute.providerModelId,
+        adapterType: modelToExecute.adapterType,
+        baseUrl: modelToExecute.baseUrl,
+        capabilities: modelToExecute.capabilities,
+        contextWindow: modelToExecute.contextWindow,
+        pricing: modelToExecute.pricing,
       },
       (chunk: string) => {
         fullAnswer += chunk;
@@ -330,33 +529,88 @@ export class RoutingService {
       abortSignal,
     );
 
+    const selectedMetrics: SelectedModelMetrics = {
+      modelId: modelToExecute.id,
+      costUsd: execResult.actualCost ?? (routingPerformed ? selectedCandidate.estimatedCost : baselineEstimate.costUsd),
+      energyWh: routingPerformed ? selectedCandidate.estimatedEnergyWh : baselineEstimate.energyWh,
+      waterLiters: routingPerformed ? selectedCandidate.estimatedWaterLiters : baselineEstimate.waterLiters,
+      carbonGramsCo2e: routingPerformed ? selectedCandidate.estimatedCarbonGrams : baselineEstimate.carbonGramsCo2e,
+      latencyMs: execResult.latencyMs,
+    };
+
+    const sustainability = SustainabilityAccountingService.computeAccounting(
+      baselineEstimate,
+      overhead,
+      selectedMetrics,
+      routingPerformed,
+      bypassReason,
+    );
+
     const explanation = this.buildScientificExplanation(
-      selected,
+      selectedCandidate,
       strategyKey,
       taskProfile,
       scoredCandidates.length,
       execResult.isLive,
+      routingPerformed,
+      bypassReason,
     );
 
     // Persist to database
     const routingResult = await this.prisma.routingResult.create({
       data: {
         taskId,
-        selectedModelId: selected.model.id,
+        selectedModelId: modelToExecute.id,
         strategy: strategyKey,
         estimatedTokens: taskProfile.totalEstimatedTokens,
         actualTokens: execResult.actualTokens,
-        estimatedCostValue: selected.estimatedCost,
+        estimatedCostValue: selectedCandidate.estimatedCost,
         estimatedCostCurrency: 'USD',
         actualCostValue: execResult.actualCost,
-        energyWh: selected.estimatedEnergyWh,
-        carbonGrams: selected.estimatedCarbonGrams,
+        energyWh: selectedCandidate.estimatedEnergyWh,
+        waterLiters: selectedCandidate.estimatedWaterLiters,
+        carbonGrams: selectedCandidate.estimatedCarbonGrams,
         environmentalStatus: 'ESTIMATED',
         methodologyVersion: ENVIRONMENTAL_METHODOLOGY.version,
-        qualityScore: selected.qualityScore,
+        qualityScore: selectedCandidate.qualityScore,
         qualityScoreType: execResult.isLive ? 'ACTUAL' : 'SIMULATED',
         explanation,
         candidateScoresJson: JSON.stringify(evaluationsJson),
+
+        baselineModelId: baselineEstimate.modelId,
+        baselineCostValue: baselineEstimate.costUsd,
+        baselineEnergyWh: baselineEstimate.energyWh,
+        baselineWaterLiters: baselineEstimate.waterLiters,
+        baselineCarbonGrams: baselineEstimate.carbonGramsCo2e,
+        baselineLatencyMs: baselineEstimate.latencyMs,
+
+        routerLatencyMs: overhead.routerLatencyMs,
+        routerCostValue: overhead.routerCostUsd,
+        routerEnergyWh: overhead.routerEnergyWh,
+        routerWaterLiters: overhead.routerWaterLiters,
+        routerCarbonGrams: overhead.routerCarbonGramsCo2e,
+
+        ecoRouteTotalCostValue: sustainability.ecoRouteTotal.costUsd,
+        ecoRouteTotalEnergyWh: sustainability.ecoRouteTotal.energyWh,
+        ecoRouteTotalWaterLiters: sustainability.ecoRouteTotal.waterLiters,
+        ecoRouteTotalCarbonGrams: sustainability.ecoRouteTotal.carbonGramsCo2e,
+        ecoRouteTotalLatencyMs: sustainability.ecoRouteTotal.latencyMs,
+
+        netCostSavings: sustainability.netSavings.costUsd,
+        netEnergySavings: sustainability.netSavings.energyWh,
+        netWaterSavings: sustainability.netSavings.waterLiters,
+        netCarbonSavings: sustainability.netSavings.carbonGramsCo2e,
+        netSavingsPercentage: sustainability.netSavings.energyPercent,
+
+        routingPerformed,
+        bypassReason,
+
+        sustainabilityJson: JSON.stringify(sustainability),
+        snapshotsJson: JSON.stringify({
+          baseline: baselineEstimate,
+          selected: selectedCandidate,
+          overhead,
+        }),
       },
     });
 
@@ -368,7 +622,7 @@ export class RoutingService {
       },
     });
 
-    await this.saveMetricSnapshots(routingResult.id, selected, taskProfile.totalEstimatedTokens);
+    await this.saveMetricSnapshots(routingResult.id, selectedCandidate, taskProfile.totalEstimatedTokens);
 
     await this.prisma.task.update({
       where: { id: taskId },
@@ -382,9 +636,9 @@ export class RoutingService {
         taskId,
         status: 'completed',
         selectedModel: {
-          modelId: selected.model.id,
-          modelName: selected.model.displayName,
-          provider: selected.model.providerName,
+          modelId: modelToExecute.id,
+          modelName: modelToExecute.displayName,
+          provider: modelToExecute.providerName,
         },
         actualUsage: {
           inputTokens: execResult.inputTokens,
@@ -394,217 +648,12 @@ export class RoutingService {
           actualCost: execResult.actualCost,
         },
         routingResultId: routingResult.id,
+        routingPerformed,
+        bypassReason,
+        sustainability,
         explanation,
       },
     });
-  }
-
-  // ---- Scientific Task Profiler ----
-
-  public analyzeTask(prompt: string): TaskAnalysisProfile {
-    const raw = prompt.trim();
-    const lower = raw.toLowerCase();
-    const words = raw.split(/\s+/).filter(Boolean);
-    const wordCount = words.length;
-
-    // Token estimation
-    const inputTokens = calculateTokenCount(raw);
-
-    // Lexical diversity (Type-Token Ratio)
-    const uniqueWords = new Set(words.map((w) => w.toLowerCase().replace(/[^a-z0-9]/g, '')));
-    const lexicalDiversity = wordCount > 0 ? Math.min(1.0, uniqueWords.size / wordCount) : 0.5;
-
-    // Structural syntax patterns
-    const codePatterns = [
-      /\b(function|def|class|interface|type|const|let|var|return|async|await)\b/,
-      /[{}();=>]/,
-      /```[\s\S]*?```/,
-      /\b(import|export|from|require)\b/,
-      /\b(sql|select|insert|update|delete|join|table)\b/i,
-      /\b(binary search|bst|algorithm|sorting|pointer|recursion)\b/i,
-    ];
-    const codeMatches = codePatterns.filter((p) => p.test(raw)).length;
-
-    const mathPatterns = [
-      /\b(derivative|integral|matrix|eigenvalue|vector|polynomial|logarithm|proof|theorem)\b/i,
-      /[∑∫√πθλσ±×÷^]/,
-      /\b(calculate|compute|solve|equation|formula|probability|variance)\b/i,
-      /\b(math|algebra|calculus|geometry|trigonometry)\b/i,
-    ];
-    const mathMatches = mathPatterns.filter((p) => p.test(raw)).length;
-
-    const archPatterns = [
-      /\b(architecture|microservices|distributed|system design|kubernetes|docker|cloud|scalability|kafka|redis)\b/i,
-      /\b(database schema|entity relationship|event-driven|cqrs|load balancer)\b/i,
-    ];
-    const archMatches = archPatterns.filter((p) => p.test(raw)).length;
-
-    const reasoningPatterns = [
-      /\b(why|explain|reason|compare|analyze|evaluate|pros and cons|trade-off|cause|effect)\b/i,
-      /\b(critique|justify|implications|consequences|hypothesize)\b/i,
-    ];
-    const reasoningMatches = reasoningPatterns.filter((p) => p.test(raw)).length;
-
-    const constraintPatterns = [
-      /\b(must|should|strict|exact|limit|maximum|minimum|format|json|only|without|exclude)\b/i,
-      /\b(step-by-step|concise|detailed|bullet points|table)\b/i,
-    ];
-    const constraintDensity = Math.min(1.0, (constraintPatterns.filter((p) => p.test(raw)).length * 2) / 10);
-
-    const translatePatterns = [
-      /\b(translate|in french|in spanish|in german|in japanese|in chinese|in italian|in russian)\b/i,
-      /\b(traduis|traduzca|übersetze)\b/i,
-    ];
-    const translateMatches = translatePatterns.filter((p) => p.test(raw)).length;
-
-    const summaryPatterns = [
-      /\b(summarize|summary|tldr|brief|condense|abstract|key takeaways|bullet points)\b/i,
-    ];
-    const summaryMatches = summaryPatterns.filter((p) => p.test(raw)).length;
-
-    const creativePatterns = [
-      /\b(story|poem|essay|creative|write a tale|fiction|dialogue|script|roleplay)\b/i,
-    ];
-    const creativeMatches = creativePatterns.filter((p) => p.test(raw)).length;
-
-    const factualPatterns = [
-      /\b(who is|what is|when was|where is|capital of|how many|height of|date of)\b/i,
-    ];
-    const factualMatches = factualPatterns.filter((p) => p.test(raw)).length;
-
-    const casualPatterns = [
-      /\b(hello|hi|hey|how are you|good morning|thanks|thank you|who are you)\b/i,
-    ];
-    const casualMatches = casualPatterns.filter((p) => p.test(raw)).length;
-
-    // Determine Domain & Modeling parameters
-    let domain = 'general';
-    let domainLabel = 'General Knowledge & Discourse';
-    let domainWeight = 0.50;
-    let expansionRatio = 2.5;
-    let minOutputTokens = 100;
-    let maxOutputTokens = 600;
-    const detectedFeatures: string[] = [];
-
-    if (mathMatches >= 2 || (mathMatches >= 1 && (reasoningMatches >= 1 || raw.includes('dy/dx') || raw.includes('=')))) {
-      domain = 'mathematical_derivation';
-      domainLabel = 'Mathematical Derivation & Formal Logic';
-      domainWeight = 0.90;
-      expansionRatio = 3.5;
-      minOutputTokens = 250;
-      maxOutputTokens = 1200;
-      detectedFeatures.push('Symbolic Math', 'Step-by-Step Proof', 'Formal Logic');
-    } else if (archMatches >= 2 || (archMatches >= 1 && codeMatches >= 1)) {
-      domain = 'code_architecture';
-      domainLabel = 'Full-Stack Software Architecture';
-      domainWeight = 0.94;
-      expansionRatio = 6.0;
-      minOutputTokens = 600;
-      maxOutputTokens = 2500;
-      detectedFeatures.push('System Architecture', 'High-Scale Blueprint', 'Distributed Topology');
-    } else if (codeMatches >= 1 || lower.includes('regex') || lower.includes('python') || lower.includes('typescript') || lower.includes('sql') || lower.includes('tree')) {
-      domain = 'code_implementation';
-      domainLabel = 'Code Synthesis & Implementation';
-      domainWeight = 0.84;
-      expansionRatio = 4.0;
-      minOutputTokens = 250;
-      maxOutputTokens = 1500;
-      detectedFeatures.push('Code Synthesis', 'Type Safety', 'Algorithmic Logic');
-    } else if (translateMatches >= 1) {
-      domain = 'cross_lingual';
-      domainLabel = 'Cross-Lingual Translation';
-      domainWeight = 0.45;
-      expansionRatio = 1.2;
-      minOutputTokens = 40;
-      maxOutputTokens = 800;
-      detectedFeatures.push('Linguistic Localization', 'Polyglot Translation');
-    } else if (summaryMatches >= 1) {
-      domain = 'summarization';
-      domainLabel = 'Text Summarization';
-      domainWeight = 0.38;
-      expansionRatio = 0.35;
-      minOutputTokens = 50;
-      maxOutputTokens = 350;
-      detectedFeatures.push('Information Condensation', 'Salient Extraction');
-    } else if (creativeMatches >= 1 && (wordCount > 10 || lower.includes('story') || lower.includes('poem'))) {
-      domain = 'creative_composition';
-      domainLabel = 'Creative Narrative & Composition';
-      domainWeight = 0.72;
-      expansionRatio = 5.0;
-      minOutputTokens = 350;
-      maxOutputTokens = 1800;
-      detectedFeatures.push('Creative Expression', 'Narrative Fluency', 'Stylistic Nuance');
-    } else if (reasoningMatches >= 1 && (wordCount > 10 || lower.includes('pros and cons') || lower.includes('compare'))) {
-      domain = 'analytical_reasoning';
-      domainLabel = 'Analytical & Strategic Reasoning';
-      domainWeight = 0.78;
-      expansionRatio = 3.5;
-      minOutputTokens = 300;
-      maxOutputTokens = 1400;
-      detectedFeatures.push('Multi-Factor Analysis', 'Cognitive Synthesis', 'Trade-off Evaluation');
-    } else if (factualMatches >= 1 || (wordCount < 12 && raw.endsWith('?'))) {
-      domain = 'factual_lookup';
-      domainLabel = 'Factual Knowledge Retrieval';
-      domainWeight = 0.22;
-      expansionRatio = 1.0;
-      minOutputTokens = 30;
-      maxOutputTokens = 150;
-      detectedFeatures.push('Direct Fact Retrieval', 'High Precision Q&A');
-    } else if (casualMatches >= 1 && wordCount < 10) {
-      domain = 'casual_conversational';
-      domainLabel = 'Conversational Interaction';
-      domainWeight = 0.12;
-      expansionRatio = 0.8;
-      minOutputTokens = 20;
-      maxOutputTokens = 100;
-      detectedFeatures.push('Conversational Polish');
-    }
-
-    let reasoningDepth = Math.min(1.0, 0.10 + reasoningMatches * 0.25 + (wordCount > 30 ? 0.20 : 0));
-    if (domain === 'mathematical_derivation') reasoningDepth = Math.max(0.88, reasoningDepth);
-    if (domain === 'code_architecture') reasoningDepth = Math.max(0.82, reasoningDepth);
-    if (domain === 'code_implementation' && (lower.includes('algorithm') || lower.includes('tree') || lower.includes('graph') || lower.includes('regex'))) {
-      reasoningDepth = Math.max(0.70, reasoningDepth);
-    }
-
-    let complexityIndex =
-      domainWeight * 0.55 +
-      reasoningDepth * 0.25 +
-      constraintDensity * 0.10 +
-      lexicalDiversity * 0.10;
-
-    if (wordCount > 40) complexityIndex = Math.min(0.99, complexityIndex + 0.08);
-    else if (wordCount < 8 && domain === 'general') complexityIndex = Math.max(0.08, complexityIndex - 0.12);
-
-    complexityIndex = Math.round(complexityIndex * 100) / 100;
-
-    let complexityTier: 'Low' | 'Moderate' | 'High' | 'Very High' = 'Moderate';
-    if (complexityIndex < 0.35) complexityTier = 'Low';
-    else if (complexityIndex < 0.65) complexityTier = 'Moderate';
-    else if (complexityIndex < 0.82) complexityTier = 'High';
-    else complexityTier = 'Very High';
-
-    const predictedOutputTokens = Math.min(
-      maxOutputTokens,
-      Math.max(minOutputTokens, Math.round(inputTokens * expansionRatio)),
-    );
-    const totalEstimatedTokens = inputTokens + predictedOutputTokens;
-
-    return {
-      domain,
-      domainLabel,
-      complexityIndex,
-      complexityTier,
-      reasoningDepth: Math.round(reasoningDepth * 100) / 100,
-      constraintDensity: Math.round(constraintDensity * 100) / 100,
-      lexicalDiversity: Math.round(lexicalDiversity * 100) / 100,
-      wordCount,
-      inputTokens,
-      predictedOutputTokens,
-      expansionRatio: Math.round(expansionRatio * 10) / 10,
-      totalEstimatedTokens,
-      detectedFeatures,
-    };
   }
 
   // ---- Parallel Stage 1 Model Evaluation ----
@@ -612,72 +661,108 @@ export class RoutingService {
   private async evaluateCandidatesParallel(
     candidates: CandidateModel[],
     task: TaskAnalysisProfile,
-    baseWeights: { tokenEfficiency: number; cost: number; quality: number; environmental: number },
+    baseWeights: { quality: number; cost: number; tokenEfficiency: number; environmental: number; latency: number },
     strategyKey: string,
   ): Promise<ScoredCandidate[]> {
-    // Dynamic Weight Adjustment (Sprout EMNLP 2024: Pareto Optimal Frontier)
+    // Dynamic weight adjustment based on task complexity
     let weights = { ...baseWeights };
     if (strategyKey === 'balanced') {
       if (task.complexityIndex < 0.35) {
         weights = {
           quality: 0.20,
-          cost: 0.42,
-          environmental: 0.28,
+          cost: 0.35,
+          environmental: 0.25,
           tokenEfficiency: 0.10,
+          latency: 0.10,
         };
       } else if (task.complexityIndex < 0.65) {
         weights = {
-          quality: 0.50,
-          cost: 0.22,
+          quality: 0.40,
+          cost: 0.20,
           environmental: 0.18,
           tokenEfficiency: 0.10,
+          latency: 0.12,
         };
       } else {
-        const qWeight = Math.min(0.85, 0.65 + (task.complexityIndex - 0.65) * 0.70);
+        const qWeight = Math.min(0.70, 0.45 + (task.complexityIndex - 0.65) * 0.60);
         const rem = 1.0 - qWeight;
         weights = {
           quality: qWeight,
-          cost: rem * 0.50,
-          environmental: rem * 0.35,
+          cost: rem * 0.40,
+          environmental: rem * 0.30,
           tokenEfficiency: rem * 0.15,
+          latency: rem * 0.15,
         };
       }
-    } else if (strategyKey === 'highest_quality' || strategyKey === 'quality_first') {
-      weights = { quality: 0.92, cost: 0.02, environmental: 0.03, tokenEfficiency: 0.03 };
-    } else if (strategyKey === 'lowest_cost' || strategyKey === 'cost_first') {
-      weights = { quality: 0.10, cost: 0.80, environmental: 0.05, tokenEfficiency: 0.05 };
-    } else if (strategyKey === 'lowest_carbon' || strategyKey === 'eco_first') {
-      weights = { quality: 0.10, cost: 0.05, environmental: 0.80, tokenEfficiency: 0.05 };
-    } else if (strategyKey === 'speed_first') {
-      weights = { quality: 0.20, cost: 0.15, environmental: 0.10, tokenEfficiency: 0.55 };
     }
 
     const needsVision = task.detectedFeatures.some((f) => /vision|image|photo/i.test(f));
     const needsToolCalling = task.detectedFeatures.some((f) => /tool|function/i.test(f));
 
-    // Parallel evaluation with Promise.allSettled
+    const providers = await this.prisma.aIProvider.findMany({
+      select: { providerKey: true, configJson: true },
+    });
+    const providerKeyMap = new Map<string, string>();
+    for (const p of providers) {
+      if (p.configJson) {
+        try {
+          const cfg = JSON.parse(p.configJson);
+          if (cfg.apiKey) providerKeyMap.set(p.providerKey, cfg.apiKey);
+        } catch {}
+      }
+    }
+
+    // Parallel evaluation across ALL models in catalog
     const rawEvaluations = await Promise.allSettled(
       candidates.map(async (model) => {
         let eligible = true;
+        let status: 'evaluated' | 'eligible' | 'excluded' | 'insufficient_data' | 'provider_unavailable' | 'model_not_installed' = 'evaluated';
         let disqualifyReason: string | undefined = undefined;
 
-        if (!model.enabled) {
+        // 1. Active Provider Health & Model Availability Verification
+        const configuredApiKey = providerKeyMap.get(model.providerKey);
+        const avail = await ProviderHealthService.checkModelAvailability(
+          model.providerKey,
+          model.providerModelId,
+          model.modelKey,
+          model.baseUrl,
+          configuredApiKey,
+          model.pricingTier,
+        );
+
+        if (!avail.isAvailable) {
           eligible = false;
+          if (avail.modelAvailability === 'NOT_INSTALLED') {
+            status = 'model_not_installed';
+          } else if (avail.providerHealth === 'UNREACHABLE') {
+            status = 'provider_unavailable';
+          } else {
+            status = 'excluded';
+          }
+          disqualifyReason = avail.reason;
+        } else if (!model.enabled) {
+          eligible = false;
+          status = 'excluded';
           disqualifyReason = 'Model disabled in catalog';
         } else if (!model.providerEnabled) {
           eligible = false;
+          status = 'excluded';
           disqualifyReason = 'Provider disabled by administrator';
         } else if (!model.available) {
           eligible = false;
-          disqualifyReason = 'Model marked unavailable / failing health checks';
+          status = 'excluded';
+          disqualifyReason = 'Model marked unavailable in catalog';
         } else if (task.totalEstimatedTokens > model.contextWindow) {
           eligible = false;
+          status = 'excluded';
           disqualifyReason = `Exceeds context window (${task.totalEstimatedTokens.toLocaleString()} > ${model.contextWindow.toLocaleString()} tokens)`;
         } else if (needsVision && !model.capabilities.includes('vision') && !model.capabilities.includes('multimodal')) {
           eligible = false;
+          status = 'excluded';
           disqualifyReason = 'Missing required vision / multimodal capability';
         } else if (needsToolCalling && !model.capabilities.includes('tool_calling') && !model.capabilities.includes('function_calling')) {
           eligible = false;
+          status = 'excluded';
           disqualifyReason = 'Missing required tool/function calling capability';
         }
 
@@ -738,9 +823,9 @@ export class RoutingService {
         else speed = 80;
 
         const estimatedLatencyMs = Math.round(120 + (task.predictedOutputTokens / speed) * 1000);
-        const latencyScore = Math.max(0.2, 1 - (estimatedLatencyMs / 4000));
+        const latencyRaw = Math.max(0.1, 1 / (1 + estimatedLatencyMs / 1000));
         const headroom = Math.min(1.0, 1.0 - (task.totalEstimatedTokens / model.contextWindow));
-        const tokenEfficiencyRaw = 0.85 * latencyScore + 0.15 * headroom;
+        const tokenEfficiencyRaw = 0.50 * latencyRaw + 0.50 * headroom;
 
         return {
           model,
@@ -748,17 +833,30 @@ export class RoutingService {
           costRaw,
           qualityRaw,
           envRaw,
+          latencyRaw,
           estimatedTokens: task.totalEstimatedTokens,
           estimatedCost,
           estimatedEnergyWh: dualPhaseEnv.energyWh,
+          estimatedWaterLiters: dualPhaseEnv.waterLiters,
           estimatedCarbonGrams: dualPhaseEnv.carbonGrams,
           estimatedLatencyMs,
           prefillEnergyWh: dualPhaseEnv.prefillEnergyWh,
           decodeEnergyWh: dualPhaseEnv.decodeEnergyWh,
           qualityScore,
-          qualitySource: 'Benchmark-derived estimate',
+          qualitySource: 'Benchmark-derived estimate (Sprout 2024)',
           eligible,
+          status: (eligible ? 'eligible' : status) as ScoredCandidate['status'],
           disqualifyReason,
+          providerHealth: avail.providerHealth,
+          modelAvailability: avail.modelAvailability,
+          wasCalled: false,
+          provenance: {
+            qualitySource: 'EcoRoute Pareto Benchmark Suite',
+            qualityBenchmark: 'MMLU / HumanEval composite',
+            latencySource: 'Empirical token decode throughput',
+            energySource: 'Dual-Phase Sequence Length Modeling',
+            pricingSource: 'Published provider pricing card',
+          },
         };
       }),
     );
@@ -772,9 +870,11 @@ export class RoutingService {
         costRaw: 0.1,
         qualityRaw: 0.1,
         envRaw: 0.1,
+        latencyRaw: 0.1,
         estimatedTokens: task.totalEstimatedTokens,
         estimatedCost: null,
         estimatedEnergyWh: null,
+        estimatedWaterLiters: null,
         estimatedCarbonGrams: null,
         estimatedLatencyMs: null,
         prefillEnergyWh: null,
@@ -782,52 +882,104 @@ export class RoutingService {
         qualityScore: 50,
         qualitySource: 'Unavailable',
         eligible: false,
+        status: 'insufficient_data' as const,
         disqualifyReason: 'Evaluation calculation failed: ' + (r.reason?.message || 'Error'),
+        providerHealth: 'UNREACHABLE' as const,
+        modelAvailability: 'UNKNOWN' as const,
+        wasCalled: false,
+        provenance: {
+          qualitySource: 'Unavailable',
+          qualityBenchmark: 'None',
+          latencySource: 'Unavailable',
+          energySource: 'Unavailable',
+          pricingSource: 'Unavailable',
+        },
       };
     });
 
+    // Separate eligible and non-eligible candidates
+    // ONLY eligible candidates are normalized and ranked!
+    const eligibleRaw = rawScores.filter((s) => s.eligible);
+
     const normalize = (values: number[]) => {
+      if (values.length === 0) return [];
       const min = Math.min(...values);
       const max = Math.max(...values);
       const range = max - min;
       return values.map((v) => (range > 0 ? 0.25 + (0.75 * (v - min)) / range : 0.5));
     };
 
-    const tokenNorm = normalize(rawScores.map((s) => s.tokenEfficiencyRaw));
-    const costNorm = normalize(rawScores.map((s) => s.costRaw));
-    const qualityNorm = normalize(rawScores.map((s) => s.qualityRaw));
-    const envNorm = normalize(rawScores.map((s) => s.envRaw));
+    const tokenNorm = normalize(eligibleRaw.map((s) => s.tokenEfficiencyRaw));
+    const costNorm = normalize(eligibleRaw.map((s) => s.costRaw));
+    const qualityNorm = normalize(eligibleRaw.map((s) => s.qualityRaw));
+    const envNorm = normalize(eligibleRaw.map((s) => s.envRaw));
+    const latencyNorm = normalize(eligibleRaw.map((s) => s.latencyRaw));
 
-    return rawScores.map((raw, i) => {
-      const scores = {
-        tokenEfficiency: tokenNorm[i]!,
-        cost: costNorm[i]!,
-        quality: qualityNorm[i]!,
-        environmental: envNorm[i]!,
-      };
+    let eligibleIndex = 0;
+    return rawScores.map((raw) => {
+      if (raw.eligible) {
+        const scores = {
+          quality: qualityNorm[eligibleIndex]!,
+          cost: costNorm[eligibleIndex]!,
+          tokenEfficiency: tokenNorm[eligibleIndex]!,
+          environmental: envNorm[eligibleIndex]!,
+          latency: latencyNorm[eligibleIndex]!,
+        };
+        const totalScore =
+          weights.quality * scores.quality +
+          weights.cost * scores.cost +
+          weights.tokenEfficiency * scores.tokenEfficiency +
+          weights.environmental * scores.environmental +
+          weights.latency * scores.latency;
 
-      const totalScore =
-        weights.tokenEfficiency * scores.tokenEfficiency +
-        weights.cost * scores.cost +
-        weights.quality * scores.quality +
-        weights.environmental * scores.environmental;
-
-      return {
-        model: raw.model,
-        scores,
-        totalScore,
-        estimatedTokens: raw.estimatedTokens,
-        estimatedCost: raw.estimatedCost,
-        estimatedEnergyWh: raw.estimatedEnergyWh,
-        estimatedCarbonGrams: raw.estimatedCarbonGrams,
-        estimatedLatencyMs: raw.estimatedLatencyMs,
-        prefillEnergyWh: raw.prefillEnergyWh,
-        decodeEnergyWh: raw.decodeEnergyWh,
-        qualityScore: raw.qualityScore,
-        qualitySource: raw.qualitySource,
-        eligible: raw.eligible,
-        disqualifyReason: raw.disqualifyReason,
-      };
+        eligibleIndex++;
+        return {
+          model: raw.model,
+          scores,
+          totalScore,
+          estimatedTokens: raw.estimatedTokens,
+          estimatedCost: raw.estimatedCost,
+          estimatedEnergyWh: raw.estimatedEnergyWh,
+          estimatedWaterLiters: raw.estimatedWaterLiters,
+          estimatedCarbonGrams: raw.estimatedCarbonGrams,
+          estimatedLatencyMs: raw.estimatedLatencyMs,
+          prefillEnergyWh: raw.prefillEnergyWh,
+          decodeEnergyWh: raw.decodeEnergyWh,
+          qualityScore: raw.qualityScore,
+          qualitySource: raw.qualitySource,
+          eligible: true,
+          status: 'eligible' as const,
+          disqualifyReason: undefined,
+          providerHealth: raw.providerHealth,
+          modelAvailability: raw.modelAvailability,
+          wasCalled: false,
+          provenance: raw.provenance,
+        };
+      } else {
+        // Disqualified models must be excluded from the ranking candidate set: totalScore is null!
+        return {
+          model: raw.model,
+          scores: { quality: 0, cost: 0, tokenEfficiency: 0, environmental: 0, latency: 0 },
+          totalScore: null,
+          estimatedTokens: raw.estimatedTokens,
+          estimatedCost: raw.estimatedCost,
+          estimatedEnergyWh: raw.estimatedEnergyWh,
+          estimatedWaterLiters: raw.estimatedWaterLiters,
+          estimatedCarbonGrams: raw.estimatedCarbonGrams,
+          estimatedLatencyMs: raw.estimatedLatencyMs,
+          prefillEnergyWh: raw.prefillEnergyWh,
+          decodeEnergyWh: raw.decodeEnergyWh,
+          qualityScore: raw.qualityScore,
+          qualitySource: raw.qualitySource,
+          eligible: false,
+          status: raw.status,
+          disqualifyReason: raw.disqualifyReason,
+          providerHealth: raw.providerHealth,
+          modelAvailability: raw.modelAvailability,
+          wasCalled: false,
+          provenance: raw.provenance,
+        };
+      }
     });
   }
 
@@ -927,7 +1079,8 @@ export class RoutingService {
   private buildEvaluationsPayload(
     scoredCandidates: ScoredCandidate[],
     taskProfile: TaskAnalysisProfile,
-    selected: ScoredCandidate,
+    selected: ScoredCandidate | null,
+    baseline: BaselineEstimate,
   ) {
     const evaluations = scoredCandidates.map((c) => ({
       modelId: c.model.id,
@@ -939,34 +1092,49 @@ export class RoutingService {
       capabilities: c.model.capabilities,
       contextWindow: c.model.contextWindow,
       pricing: c.model.pricing,
+      pricingTier: c.model.pricingTier,
+      pricingSource: c.model.pricingSource,
+      pricingLastUpdated: c.model.pricingLastUpdated,
+      inputTokens: taskProfile.inputTokens,
+      predictedOutputTokens: taskProfile.predictedOutputTokens,
       eligible: c.eligible,
+      status: c.status,
       disqualifyReason: c.disqualifyReason,
+      providerHealth: c.providerHealth,
+      modelAvailability: c.modelAvailability,
+      wasCalled: c.wasCalled ?? false,
       estimatedTokens: c.estimatedTokens,
       estimatedCost: c.estimatedCost != null ? Number(c.estimatedCost.toFixed(6)) : null,
+      estimatedEnergy: c.estimatedEnergyWh != null ? Number(c.estimatedEnergyWh.toFixed(4)) : null,
+      estimatedWater: c.estimatedWaterLiters != null ? Number(c.estimatedWaterLiters.toFixed(4)) : null,
       estimatedCarbon: c.estimatedCarbonGrams != null ? Number(c.estimatedCarbonGrams.toFixed(4)) : null,
       qualityScore: c.qualityScore,
       qualitySource: c.qualitySource,
       latencyMs: c.estimatedLatencyMs ?? null,
-      routingScore: Number((c.totalScore * 100).toFixed(1)),
+      routingScore: c.totalScore != null ? Number((c.totalScore * 100).toFixed(1)) : null,
       breakdown: {
         quality: Number((c.scores.quality * 100).toFixed(1)),
         cost: Number((c.scores.cost * 100).toFixed(1)),
         tokenEfficiency: Number((c.scores.tokenEfficiency * 100).toFixed(1)),
         environmental: Number((c.scores.environmental * 100).toFixed(1)),
+        latency: Number((c.scores.latency * 100).toFixed(1)),
       },
-      status: c.eligible ? 'evaluated' : 'ineligible',
-      isSelected: c.model.id === selected.model.id,
+      provenance: c.provenance,
+      isSelected: selected ? c.model.id === selected.model.id : false,
+      isBaseline: c.model.id === baseline.modelId,
     }));
 
     return {
       taskAnalysis: taskProfile,
       evaluations,
-      candidates: evaluations, // backwards compatibility
-      selectedModel: {
-        modelId: selected.model.id,
-        name: selected.model.displayName,
-        provider: selected.model.providerName,
-      },
+      baseline,
+      selectedModel: selected
+        ? {
+            modelId: selected.model.id,
+            name: selected.model.displayName,
+            provider: selected.model.providerName,
+          }
+        : null,
     };
   }
 
@@ -976,26 +1144,24 @@ export class RoutingService {
     task: TaskAnalysisProfile,
     candidateCount: number,
     isLive: boolean,
+    routingPerformed: boolean,
+    bypassReason?: string | null,
   ): string {
     const parts = [
       `Task analyzed as ${task.domainLabel} (Complexity: ${(task.complexityIndex * 100).toFixed(0)}%, Tier: ${task.complexityTier}, Expansion: ${task.expansionRatio}x).`,
-      `Applying Pareto-optimal routing across ${candidateCount} models under the "${strategy}" strategy (Sprout EMNLP 2024 methodology).`,
-      `${selected.model.displayName} (${selected.model.providerName}) emerged as optimal with an overall score of ${(selected.totalScore * 100).toFixed(1)}%.`,
-      `Quality Fitness: ${selected.qualityScore}/100, Cost Efficiency: ${(selected.scores.cost * 100).toFixed(0)}%, Environmental Score: ${(selected.scores.environmental * 100).toFixed(0)}%.`,
     ];
 
-    if (selected.estimatedCost != null) {
-      parts.push(`Est. Cost: $${selected.estimatedCost.toFixed(6)} USD.`);
-    }
-
-    if (selected.estimatedCarbonGrams != null) {
-      parts.push(`Est. Carbon: ${selected.estimatedCarbonGrams.toFixed(4)}g CO₂.`);
+    if (!routingPerformed) {
+      parts.push(`Direct execution selected because: ${bypassReason || 'routing was not expected to provide sufficient net benefit'}.`);
+    } else {
+      parts.push(`Evaluated across ${candidateCount} models under "${strategy}" strategy.`);
+      parts.push(`${selected.model.displayName} emerged with optimal decision score of ${selected.totalScore != null ? (selected.totalScore * 100).toFixed(1) : 'N/A'}%.`);
     }
 
     if (isLive) {
       parts.push(`Executed via live ${selected.model.providerName} API.`);
     } else {
-      parts.push(`Executed with high-fidelity contextual simulation (AI_MOCK_MODE).`);
+      parts.push(`Executed in [Simulation Mode] (AI_MOCK_MODE=true).`);
     }
 
     return parts.join(' ');
@@ -1017,7 +1183,7 @@ export class RoutingService {
         metricName: 'quality_score',
         value: selected.qualityScore,
         unit: 'score',
-        measurementType: 'SIMULATED' as const,
+        measurementType: 'MODELED' as const,
         methodologyVersion: 'v2-sprout-pareto',
         dataSource: 'Sprout Dynamic Fitness Function',
       },
@@ -1030,7 +1196,7 @@ export class RoutingService {
         value: selected.estimatedCost,
         unit: 'USD',
         measurementType: 'ESTIMATED' as const,
-        methodologyVersion: 'v1',
+        methodologyVersion: 'v2',
         dataSource: 'Model pricing metadata',
       });
     }
@@ -1041,12 +1207,83 @@ export class RoutingService {
         metricName: 'carbon_impact',
         value: selected.estimatedCarbonGrams,
         unit: 'grams CO2',
-        measurementType: 'ESTIMATED' as const,
+        measurementType: 'MODELED' as const,
         methodologyVersion: 'v2-dual-phase',
         dataSource: 'Sequence-Length Energy Dynamics (Sustainable Computing 2023)',
       });
     }
 
+    if (selected.estimatedWaterLiters != null) {
+      snapshots.push({
+        routingResultId,
+        metricName: 'water_impact',
+        value: selected.estimatedWaterLiters,
+        unit: 'liters',
+        measurementType: 'MODELED' as const,
+        methodologyVersion: 'v2-water-intensity',
+        dataSource: 'Regional Utility Water Footprint',
+      });
+    }
+
     await this.prisma.metricSnapshot.createMany({ data: snapshots });
+  }
+
+  private buildProviderSummaries(candidates: ScoredCandidate[]): Array<{
+    providerKey: string;
+    providerName: string;
+    statusSummary: string;
+    availableCount: number;
+    totalCount: number;
+  }> {
+    const providerMap = new Map<string, { providerName: string; candidates: ScoredCandidate[] }>();
+    for (const c of candidates) {
+      const existing = providerMap.get(c.model.providerKey);
+      if (existing) {
+        existing.candidates.push(c);
+      } else {
+        providerMap.set(c.model.providerKey, { providerName: c.model.providerName, candidates: [c] });
+      }
+    }
+
+    const summaries: Array<{
+      providerKey: string;
+      providerName: string;
+      statusSummary: string;
+      availableCount: number;
+      totalCount: number;
+    }> = [];
+
+    for (const [providerKey, data] of providerMap.entries()) {
+      const cands = data.candidates;
+      const readyCands = cands.filter((c) => c.eligible);
+      let statusSummary = '';
+
+      if (readyCands.length > 0) {
+        statusSummary = `Ready (${readyCands.length} available model${readyCands.length > 1 ? 's' : ''})`;
+      } else if (cands.every((c) => c.disqualifyReason?.includes('PAID_MODEL_EXCLUDED') || c.disqualifyReason?.includes('commercial paid model'))) {
+        statusSummary = 'Excluded (commercial paid models only in FREE_MODELS_ONLY mode)';
+      } else if (cands.some((c) => c.providerHealth === 'UNCONFIGURED' || c.disqualifyReason?.includes('API key missing') || c.disqualifyReason?.includes('MISSING_API_KEY'))) {
+        statusSummary = 'API key missing / not configured';
+      } else if (cands.some((c) => c.disqualifyReason?.includes('FREE_TIER_QUOTA_EXHAUSTED') || c.disqualifyReason?.toLowerCase().includes('quota exhausted'))) {
+        statusSummary = 'Free-tier quota exhausted';
+      } else if (cands.some((c) => c.disqualifyReason?.includes('LOCAL_MODEL_NOT_INSTALLED') || c.modelAvailability === 'NOT_INSTALLED')) {
+        statusSummary = 'Ollama daemon running, but required free model not installed';
+      } else if (cands.some((c) => c.providerHealth === 'UNREACHABLE')) {
+        statusSummary = providerKey === 'ollama' ? 'Ollama daemon not running' : 'Provider unreachable';
+      } else {
+        const firstReason = cands[0]?.disqualifyReason || 'Ineligible';
+        statusSummary = firstReason;
+      }
+
+      summaries.push({
+        providerKey,
+        providerName: data.providerName,
+        statusSummary,
+        availableCount: readyCands.length,
+        totalCount: cands.length,
+      });
+    }
+
+    return summaries;
   }
 }

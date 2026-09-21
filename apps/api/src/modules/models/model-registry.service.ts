@@ -4,6 +4,7 @@
 // ============================================================================
 
 import { PrismaClient } from '@prisma/client';
+import { KNOWN_MODEL_PRICING, PricingTier } from '@ecoroute/config';
 
 export interface CandidateModelRecord {
   id: string;
@@ -24,6 +25,14 @@ export interface CandidateModelRecord {
   available: boolean;
   providerEnabled: boolean;
   isMockModel: boolean;
+  pricingTier: PricingTier;
+  pricingSource: string;
+  pricingLastUpdated: string;
+  pricingLastVerified?: Date | null;
+  executionMode: 'cloud' | 'local';
+  availabilityStatus: string;
+  accountAccessStatus: string;
+  quotaStatus: string;
   pricing: {
     inputPricePerMillionTokens: number | null;
     outputPricePerMillionTokens: number | null;
@@ -52,6 +61,8 @@ export class ModelRegistryCache {
 
   /**
    * Retrieves all enabled active models in a single query, cached in memory.
+   * In normal production execution (AI_MOCK_MODE=false), mock simulation models
+   * are strictly filtered out of the catalog.
    */
   static async getActiveModels(
     prisma: PrismaClient,
@@ -62,10 +73,22 @@ export class ModelRegistryCache {
       return this.cachedModels;
     }
 
+    const isMockModeExplicit = process.env.AI_MOCK_MODE === 'true';
+
+    const whereClause: any = {
+      status: 'ACTIVE',
+    };
+
+    // In production, NEVER load mock simulation models into the active routing catalog
+    if (!isMockModeExplicit) {
+      whereClause.isMockModel = false;
+      whereClause.provider = {
+        providerKey: { not: 'mock' },
+      };
+    }
+
     const models = await prisma.aIModel.findMany({
-      where: {
-        status: 'ACTIVE',
-      },
+      where: whereClause,
       include: { provider: true },
       orderBy: [{ provider: { name: 'asc' } }, { displayName: 'asc' }],
     });
@@ -91,6 +114,26 @@ export class ModelRegistryCache {
         environmentalMetrics = JSON.parse(m.environmentalMetricsJson || '{}');
       } catch {}
 
+      // Resolve pricing metadata
+      const known = KNOWN_MODEL_PRICING[m.modelKey] || KNOWN_MODEL_PRICING[m.providerModelId || ''];
+      let pricingTier: PricingTier = (m.pricingTier as PricingTier) || 'unknown';
+      let pricingSource = m.pricingSource || 'Unverified Pricing';
+      let pricingLastUpdated = m.pricingLastVerified ? m.pricingLastVerified.toISOString().split('T')[0]! : '2026-03-01';
+
+      if (known) {
+        pricingTier = known.pricingTier;
+        pricingSource = known.pricingSource;
+        pricingLastUpdated = known.pricingLastUpdated;
+      } else if (m.provider.providerKey === 'ollama') {
+        pricingTier = 'free';
+        pricingSource = m.pricingSource || 'Ollama Local Daemon (0 API fee)';
+      } else if (m.isMockModel) {
+        pricingTier = isMockModeExplicit ? 'free' : 'unknown';
+        pricingSource = 'Deterministic Simulation Engine';
+      }
+
+      const executionMode = (m.executionMode as 'cloud' | 'local') || (m.provider.providerKey === 'ollama' ? 'local' : 'cloud');
+
       return {
         id: m.id,
         modelKey: m.modelKey,
@@ -110,9 +153,17 @@ export class ModelRegistryCache {
         available: m.available,
         providerEnabled: m.provider.enabled,
         isMockModel: m.isMockModel,
+        pricingTier,
+        pricingSource,
+        pricingLastUpdated,
+        pricingLastVerified: m.pricingLastVerified,
+        executionMode,
+        availabilityStatus: m.availabilityStatus || 'READY',
+        accountAccessStatus: m.accountAccessStatus || 'eligible',
+        quotaStatus: m.quotaStatus || 'available',
         pricing: {
-          inputPricePerMillionTokens: pricing.inputPricePerMillionTokens ?? 0.15,
-          outputPricePerMillionTokens: pricing.outputPricePerMillionTokens ?? 0.6,
+          inputPricePerMillionTokens: pricing.inputPricePerMillionTokens ?? (pricingTier === 'free' ? 0 : 0.15),
+          outputPricePerMillionTokens: pricing.outputPricePerMillionTokens ?? (pricingTier === 'free' ? 0 : 0.60),
         },
         performance,
         environmentalMetrics,

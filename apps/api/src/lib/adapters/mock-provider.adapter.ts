@@ -59,8 +59,10 @@ export class MockProviderAdapter implements AIProviderAdapter {
       estimatedCostUsd = (inputTokens * inPrice + outputTokens * outPrice) / 1_000_000;
     }
 
+    const simText = `[Simulation Mode]\n\n${result.answer}`;
+
     return {
-      text: result.answer,
+      text: simText,
       model: request.model,
       provider: this.providerKey,
       usage: { inputTokens, outputTokens, totalTokens },
@@ -84,6 +86,9 @@ export class MockProviderAdapter implements AIProviderAdapter {
       providerKey: this.providerKey,
     });
 
+    const simPrefix = `[Simulation Mode]\n\n`;
+    onChunk(simPrefix);
+
     // Stream the generated answer in natural word tokens without artificial delay
     const words = result.answer.split(/(\s+)/);
     for (const word of words) {
@@ -93,6 +98,8 @@ export class MockProviderAdapter implements AIProviderAdapter {
     }
 
     const latencyMs = Math.max(1, Date.now() - startTime);
+    const fullText = simPrefix + result.answer;
+
     const inputTokens = result.tokens.inputTokens;
     const outputTokens = result.tokens.outputTokens;
     const totalTokens = result.tokens.totalTokens;
@@ -105,7 +112,7 @@ export class MockProviderAdapter implements AIProviderAdapter {
     }
 
     return {
-      text: result.answer,
+      text: fullText,
       model: request.model,
       provider: this.providerKey,
       usage: { inputTokens, outputTokens, totalTokens },
