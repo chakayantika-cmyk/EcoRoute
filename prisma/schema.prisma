@@ -1,0 +1,251 @@
+// ============================================================================
+// EcoRoute AI — Prisma Schema
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---- Users ----
+model User {
+  id           String        @id @default(uuid())
+  email        String        @unique
+  passwordHash String        @map("password_hash")
+  displayName  String        @map("display_name")
+  role         String      @default("USER")
+  status       String @default("ACTIVE")
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+
+  sessions    Session[]
+  tasks       Task[]
+  preferences RoutingPreference?
+  auditEvents AuditEvent[]
+
+  @@map("users")
+}
+
+// ---- Sessions ----
+model Session {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  tokenHash String    @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("sessions")
+}
+
+// ---- Tasks ----
+model Task {
+  id              String     @id @default(uuid())
+  userId          String     @map("user_id")
+  inputText       String     @map("input_text")
+  status          String @default("PENDING")
+  inputTokenCount Int?       @map("input_token_count")
+  createdAt       DateTime   @default(now()) @map("created_at")
+  completedAt     DateTime?  @map("completed_at")
+  errorInfo       String?    @map("error_info")
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  routingResult RoutingResult?
+  answer        GeneratedAnswer?
+
+  @@index([userId])
+  @@index([createdAt])
+  @@index([status])
+  @@map("tasks")
+}
+
+// ---- Routing Results ----
+model RoutingResult {
+  id                   String            @id @default(uuid())
+  taskId               String            @unique @map("task_id")
+  selectedModelId      String            @map("selected_model_id")
+  strategy             String
+  estimatedTokens      Int               @map("estimated_tokens")
+  actualTokens         Int?              @map("actual_tokens")
+  estimatedCostValue   Float?            @map("estimated_cost_value")
+  estimatedCostCurrency String           @default("USD") @map("estimated_cost_currency")
+  actualCostValue      Float?            @map("actual_cost_value")
+  energyWh             Float?            @map("energy_wh")
+  carbonGrams          Float?            @map("carbon_grams")
+  environmentalStatus  String   @default("ESTIMATED") @map("environmental_status")
+  methodologyVersion   String            @default("v1") @map("methodology_version")
+  qualityScore         Int?              @map("quality_score")
+  qualityScoreType     String   @default("SIMULATED") @map("quality_score_type")
+  explanation          String
+  candidateScoresJson  String?           @map("candidate_scores_json")
+  createdAt            DateTime          @default(now()) @map("created_at")
+
+  task           Task             @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  selectedModel  AIModel          @relation(fields: [selectedModelId], references: [id])
+  metricSnapshots MetricSnapshot[]
+
+  @@index([taskId])
+  @@map("routing_results")
+}
+
+// ---- Generated Answers ----
+model GeneratedAnswer {
+  id               String   @id @default(uuid())
+  taskId           String   @unique @map("task_id")
+  answerText       String   @map("answer_text")
+  providerRequestId String? @map("provider_request_id")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@map("generated_answers")
+}
+
+// ---- AI Providers ----
+model AIProvider {
+  id                  String             @id @default(uuid())
+  name                String
+  providerKey         String             @unique @map("provider_key")
+  slug                String?            @unique
+  adapterType         String             @default("openai_compatible") @map("adapter_type")
+  baseUrl             String?            @map("base_url")
+  enabled             Boolean            @default(true)
+  healthStatus        String             @default("HEALTHY") @map("health_status")
+  lastHealthCheckAt   DateTime?          @map("last_health_check_at")
+  configurationStatus String             @default("CONFIGURED") @map("configuration_status")
+  status              String             @default("ACTIVE")
+  configJson          String?            @map("config_json")
+  createdAt           DateTime           @default(now()) @map("created_at")
+  updatedAt           DateTime           @updatedAt @map("updated_at")
+
+  models              AIModel[]
+  healthChecks        ModelHealthCheck[]
+
+  @@map("ai_providers")
+}
+
+// ---- AI Models ----
+model AIModel {
+  id                         String             @id @default(uuid())
+  providerId                 String             @map("provider_id")
+  modelKey                   String             @map("model_key")
+  providerModelId            String             @default("") @map("provider_model_id")
+  displayName                String             @map("display_name")
+  family                     String             @default("general")
+  version                    String             @default("1.0")
+  description                String?
+  enabled                    Boolean            @default(true)
+  available                  Boolean            @default(true)
+  isDefault                  Boolean            @default(false) @map("is_default")
+  isMockModel                Boolean            @default(false) @map("is_mock_model")
+  capabilitiesJson           String             @map("capabilities_json")
+  contextWindow              Int                @map("context_window")
+  contextWindowTokens        Int                @default(128000) @map("context_window_tokens")
+  maxOutputTokens            Int                @default(4096) @map("max_output_tokens")
+  pricingJson                String             @map("pricing_json")
+  performanceJson            String?            @map("performance_json")
+  environmentalMetricsJson   String?            @map("environmental_metrics_json")
+  tagsJson                   String?            @map("tags_json")
+  status                     String             @default("ACTIVE")
+  createdAt                  DateTime           @default(now()) @map("created_at")
+  updatedAt                  DateTime           @updatedAt @map("updated_at")
+
+  provider                   AIProvider         @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  routingResults             RoutingResult[]
+  healthChecks               ModelHealthCheck[]
+
+  @@unique([providerId, modelKey])
+  @@index([status])
+  @@index([enabled])
+  @@map("ai_models")
+}
+
+// ---- Model Health Checks ----
+model ModelHealthCheck {
+  id           String     @id @default(uuid())
+  providerId   String     @map("provider_id")
+  modelId      String?    @map("model_id")
+  status       String     @default("HEALTHY")
+  latencyMs    Int?       @map("latency_ms")
+  errorMessage String?    @map("error_message")
+  checkedAt    DateTime   @default(now()) @map("checked_at")
+
+  provider     AIProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  model        AIModel?   @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@index([providerId])
+  @@index([modelId])
+  @@map("model_health_checks")
+}
+
+// ---- Routing Preferences ----
+model RoutingPreference {
+  id                    String   @id @default(uuid())
+  userId                String   @unique @map("user_id")
+  tokenEfficiencyWeight Float    @default(0.25) @map("token_efficiency_weight")
+  costWeight            Float    @default(0.25) @map("cost_weight")
+  qualityWeight         Float    @default(0.25) @map("quality_weight")
+  environmentalWeight   Float    @default(0.25) @map("environmental_weight")
+  defaultStrategy       String   @default("balanced") @map("default_strategy")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("routing_preferences")
+}
+
+// ---- Metric Snapshots ----
+model MetricSnapshot {
+  id                 String          @id @default(uuid())
+  routingResultId    String          @map("routing_result_id")
+  metricName         String          @map("metric_name")
+  value              Float?
+  unit               String
+  measurementType    String @map("measurement_type")
+  methodologyVersion String          @default("v1") @map("methodology_version")
+  dataSource         String          @default("") @map("data_source")
+  createdAt          DateTime        @default(now()) @map("created_at")
+
+  routingResult RoutingResult @relation(fields: [routingResultId], references: [id], onDelete: Cascade)
+
+  @@index([routingResultId])
+  @@map("metric_snapshots")
+}
+
+// ---- Audit Events ----
+model AuditEvent {
+  id           String   @id @default(uuid())
+  userId       String?  @map("user_id")
+  eventType    String   @map("event_type")
+  resourceType String   @map("resource_type")
+  resourceId   String?  @map("resource_id")
+  metadataJson String?  @map("metadata_json")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([eventType])
+  @@index([createdAt])
+  @@map("audit_events")
+}
+
+// ---- OTP Verification ----
+model OTP {
+  id        String   @id @default(uuid())
+  email     String
+  code      String
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([email])
+  @@map("otps")
+}

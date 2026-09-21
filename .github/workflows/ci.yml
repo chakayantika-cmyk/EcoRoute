@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint-and-typecheck
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ecoroute_ai_test
+          POSTGRES_USER: ecoroute
+          POSTGRES_PASSWORD: ecoroute_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ecoroute -d ecoroute_ai_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://ecoroute:ecoroute_test@localhost:5432/ecoroute_ai_test?schema=public
+      JWT_ACCESS_SECRET: test-access-secret-minimum-16-chars
+      JWT_REFRESH_SECRET: test-refresh-secret-minimum-16-chars
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx prisma migrate deploy --schema=prisma/schema.prisma
+      - run: npm run test
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate --schema=prisma/schema.prisma
+      - run: npm run build

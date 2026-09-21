@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EcoRoute AI</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-white text-gray-900">
+    <div id="root"></div>
+    <script type="text/babel">
+        const { useState, useRef, useEffect } = React;
+
+        // Design tokens aligned with The Brand Identity aesthetic
+        const COLORS = {
+          bg: '#FAFAF8',
+          text: '#1A1A1A',
+          textLight: '#737373',
+          border: '#E8E8E6',
+          accent: '#2D5016', // Eco-green
+          accentLight: '#E8F0E0'
+        };
+
+        const TYPOGRAPHY = {
+          display: 'font-serif text-5xl font-light tracking-tight',
+          heading: 'font-serif text-3xl font-light tracking-tight',
+          subheading: 'font-sans text-lg font-light text-gray-600',
+          body: 'font-sans text-base leading-relaxed text-gray-700',
+          small: 'font-sans text-sm text-gray-600'
+        };
+
+        // Mock data
+        const MOCK_ROUTES = [
+          { id: 1, name: 'Downtown to Suburbs', distance: 12.3, carbon: 2.1, time: 24 },
+          { id: 2, name: 'Airport Commute', distance: 28.5, carbon: 4.8, time: 42 },
+          { id: 3, name: 'City Center Loop', distance: 8.7, carbon: 1.5, time: 18 }
+        ];
+
+        const MOCK_HISTORY = [
+          { date: 'Sept 14', route: 'Downtown to Suburbs', saved: 0.8 },
+          { date: 'Sept 13', route: 'City Center Loop', saved: 0.5 },
+          { date: 'Sept 12', route: 'Airport Commute', saved: 1.2 }
+        ];
+
+        // Header component
+        function Header() {
+          return (
+            <header className="border-b border-gray-200 py-8 px-6">
+              <div className="max-w-7xl mx-auto">
+                <h1 className={`${TYPOGRAPHY.heading} mb-2`}>EcoRoute</h1>
+                <p className={TYPOGRAPHY.subheading}>
+                  Navigate with impact. Every route optimized for the planet.
+                </p>
+              </div>
+            </header>
+          );
+        }
+
+        // Task Composer component
+        function TaskComposer({ onCompose }) {
+          const [origin, setOrigin] = useState('');
+          const [destination, setDestination] = useState('');
+
+          const handleCompose = () => {
+            if (origin && destination) {
+              onCompose({ origin, destination });
+              setOrigin('');
+              setDestination('');
+            }
+          };
+
+          return (
+            <div className="max-w-7xl mx-auto px-6 py-12 border-b border-gray-200">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div>
+                  <label className={`block ${TYPOGRAPHY.small} font-semibold mb-2`}>
+                    From
+                  </label>
+                  <input
+                    type="text"
+                    value={origin}
+                    onChange={(e) => setOrigin(e.target.value)}
+                    placeholder="Starting location"
+                    className="w-full px-4 py-3 border border-gray-200 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-green-700"
+                  />
+                </div>
+                <div>
+                  <label className={`block ${TYPOGRAPHY.small} font-semibold mb-2`}>
+                    To
+                  </label>
+                  <input
+                    type="text"
+                    value={destination}
+                    onChange={(e) => setDestination(e.target.value)}
+                    placeholder="Destination"
+                    className="w-full px-4 py-3 border border-gray-200 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-green-700"
+                  />
+                </div>
+                <div className="flex items-end">
+                  <button
+                    onClick={handleCompose}
+                    className="w-full px-6 py-3 bg-green-800 text-white hover:bg-green-900 font-medium transition"
+                  >
+                    Optimize Route
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+        // Result card component
+        function ResultCard({ route, isOptimal }) {
+          return (
+            <div className={`border ${isOptimal ? 'border-green-200 bg-green-50' : 'border-gray-200'} p-6`}>
+              <div className="flex justify-between items-start mb-4">
+                <h3 className="font-serif text-lg font-medium">{route.name}</h3>
+                {isOptimal && (
+                  <span className="text-xs font-semibold text-green-700 bg-green-100 px-3 py-1">
+                    OPTIMAL
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-3 gap-4">
+                <div>
+                  <p className={TYPOGRAPHY.small}>Distance</p>
+                  <p className="font-serif text-2xl font-light">{route.distance} km</p>
+                </div>
+                <div>
+                  <p className={TYPOGRAPHY.small}>Carbon</p>
+                  <p className="font-serif text-2xl font-light text-green-700">{route.carbon} kg</p>
+                </div>
+                <div>
+                  <p className={TYPOGRAPHY.small}>Time</p>
+                  <p className="font-serif text-2xl font-light">{route.time} min</p>
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+        // Results panel component
+        function ResultsPanel({ routes, activeRoute, setActiveRoute }) {
+          if (!routes || routes.length === 0) return null;
+
+          return (
+            <div className="max-w-7xl mx-auto px-6 py-12 border-b border-gray-200">
+              <h2 className={`${TYPOGRAPHY.heading} mb-8`}>Optimized Routes</h2>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                {routes.map((route, idx) => (
+                  <button
+                    key={route.id}
+                    onClick={() => setActiveRoute(idx)}
+                    className="text-left hover:opacity-80 transition"
+                  >
+                    <ResultCard route={route} isOptimal={activeRoute === idx} />
+                  </button>
+                ))}
+              </div>
+            </div>
+          );
+        }
+
+        // History view component
+        function HistoryView({ history }) {
+          return (
+            <div className="max-w-7xl mx-auto px-6 py-12 border-b border-gray-200">
+              <h2 className={`${TYPOGRAPHY.heading} mb-8`}>Recent Routes</h2>
+              <div className="space-y-4">
+                {history.map((item, idx) => (
+                  <div key={idx} className="flex items-center justify-between py-4 border-b border-gray-200 last:border-0">
+                    <div className="flex-1">
+                      <p className="font-medium text-gray-900">{item.route}</p>
+                      <p className={TYPOGRAPHY.small}>{item.date}</p>
+                    </div>
+                    <div className="text-right">
+                      <p className="font-serif text-lg text-green-700">{item.saved} kg CO₂</p>
+                      <p className={TYPOGRAPHY.small}>saved</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        }
+
+        // Main app component
+        function App() {
+          const [routes, setRoutes] = useState([]);
+          const [activeRoute, setActiveRoute] = useState(null);
+          const [currentQuery, setCurrentQuery] = useState(null);
+
+          const handleCompose = (query) => {
+            setCurrentQuery(query);
+            setRoutes(MOCK_ROUTES);
+            setActiveRoute(0);
+          };
+
+          return (
+            <div style={{ backgroundColor: COLORS.bg }} className="min-h-screen">
+              <Header />
+              <TaskComposer onCompose={handleCompose} />
+              
+              {currentQuery && (
+                <div className="max-w-7xl mx-auto px-6 py-12 border-b border-gray-200">
+                  <p className={`${TYPOGRAPHY.small} mb-2`}>Query:</p>
+                  <p className="font-serif text-xl">
+                    {currentQuery.origin} → {currentQuery.destination}
+                  </p>
+                </div>
+              )}
+
+              {routes.length > 0 && (
+                <ResultsPanel
+                  routes={routes}
+                  activeRoute={activeRoute}
+                  setActiveRoute={setActiveRoute}
+                />
+              )}
+
+              <HistoryView history={MOCK_HISTORY} />
+
+              <footer className="max-w-7xl mx-auto px-6 py-12 text-center">
+                <p className={TYPOGRAPHY.small}>
+                  EcoRoute uses advanced algorithms to minimize environmental impact.
+                </p>
+                <p className={`${TYPOGRAPHY.small} mt-4`}>© 2026 EcoRoute AI</p>
+              </footer>
+            </div>
+          );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
